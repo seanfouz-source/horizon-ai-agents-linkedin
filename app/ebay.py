@@ -353,8 +353,8 @@ class EbayClient:
                 f"/sell/feed/v1/task/{quote(task_id, safe='')}/upload_file",
                 files={
                     "file": (
-                        "eBay-draft-listing-template-Horizon-Wireless.csv",
-                        csv_text.encode("utf-8-sig"),
+                        "eBay-draft-listings-template-Horizon-Wireless.csv",
+                        csv_text.encode("utf-8"),
                         "text/csv",
                     )
                 },
@@ -392,10 +392,13 @@ class EbayClient:
     ) -> str:
         async with httpx.AsyncClient(base_url=self.base_url, timeout=60) as client:
             await self._ensure_access_token(client)
+            result_headers = self._headers()
+            result_headers["Accept"] = "application/octet-stream"
+            result_headers.pop("Content-Type", None)
             response = await self._get(
                 client,
                 f"/sell/feed/v1/task/{quote(str(task_id), safe='')}/download_result_file",
-                headers=self._headers(),
+                headers=result_headers,
             )
             response.raise_for_status()
             content = response.content
@@ -433,14 +436,35 @@ class EbayClient:
         output = io.StringIO(newline="")
         writer = csv.writer(output, lineterminator="\r\n")
         writer.writerow(
-            ["#INFO", "Version=1.0.0", "Template=eBay-draft-listing-template_US"]
+            ["#INFO", "Version=0.0.2", "Template= eBay-draft-listings-template_US"]
             + [""] * (len(headers) - 3)
         )
         writer.writerow(
-            ["#INFO", "Action=Draft", "SiteID=US", "Country=US", "Currency=USD"]
-            + [""] * (len(headers) - 5)
+            [
+                "#INFO Action and Category ID are required fields. "
+                "1) Set Action to Draft "
+                "2) Please find the category ID for your listings here: "
+                "https://pages.ebay.com/sellerinformation/news/categorychanges.html"
+            ]
+            + [""] * (len(headers) - 1)
         )
-        writer.writerow(headers)
+        writer.writerow(
+            [
+                "#INFO After you've successfully uploaded your draft from the "
+                "Seller Hub Reports tab, complete your drafts to active listings "
+                "here: https://www.ebay.com/sh/lst/drafts"
+            ]
+            + [""] * (len(headers) - 1)
+        )
+        writer.writerow(
+            ["#INFO"] + [""] * (len(headers) - 1)
+        )
+        writer.writerow(
+            [
+                "Action(SiteID=US|Country=US|Currency=USD|Version=1193|CC=UTF-8)",
+                *headers[1:],
+            ]
+        )
         for draft in drafts:
             writer.writerow(
                 [

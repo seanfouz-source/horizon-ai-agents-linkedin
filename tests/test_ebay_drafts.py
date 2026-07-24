@@ -55,18 +55,18 @@ def test_seller_hub_draft_csv_uses_visible_draft_action_and_saved_images():
 
     assert rows[0][:3] == [
         "#INFO",
-        "Version=1.0.0",
-        "Template=eBay-draft-listing-template_US",
+        "Version=0.0.2",
+        "Template= eBay-draft-listings-template_US",
     ]
-    assert rows[1][:5] == [
-        "#INFO",
-        "Action=Draft",
-        "SiteID=US",
-        "Country=US",
-        "Currency=USD",
-    ]
-    assert rows[2] == [
-        "Action",
+    assert rows[1][0].startswith(
+        "#INFO Action and Category ID are required fields."
+    )
+    assert rows[2][0].startswith(
+        "#INFO After you've successfully uploaded your draft"
+    )
+    assert rows[3] == ["#INFO"] + [""] * 10
+    assert rows[4] == [
+        "Action(SiteID=US|Country=US|Currency=USD|Version=1193|CC=UTF-8)",
         "Custom label (SKU)",
         "Category ID",
         "Title",
@@ -78,7 +78,7 @@ def test_seller_hub_draft_csv_uses_visible_draft_action_and_saved_images():
         "Description",
         "Format",
     ]
-    data_rows = rows[3:]
+    data_rows = rows[5:]
     assert len(data_rows) == 69
     assert {row[0] for row in data_rows} == {"Draft"}
     assert all(row[1].startswith("SH-HW-WM-202607-") for row in data_rows)
@@ -86,6 +86,39 @@ def test_seller_hub_draft_csv_uses_visible_draft_action_and_saved_images():
     assert all(row[7].startswith("https://i.ebayimg.com/") for row in data_rows)
     assert {row[8] for row in data_rows} == {"NEW", "USED"}
     assert {row[10] for row in data_rows} == {"FixedPrice"}
+
+
+class FakeDraftResultAsyncClient:
+    request_headers: dict[str, str] = {}
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return None
+
+    async def get(self, path, params=None, headers=None):
+        assert path == "/sell/feed/v1/task/TASK-1/download_result_file"
+        FakeDraftResultAsyncClient.request_headers = dict(headers or {})
+        request = httpx.Request("GET", f"https://api.ebay.com{path}")
+        return httpx.Response(200, content=b"row,status\r\n1,Success\r\n", request=request)
+
+
+def test_seller_hub_result_file_requests_binary_content(monkeypatch):
+    monkeypatch.setattr(ebay_module.httpx, "AsyncClient", FakeDraftResultAsyncClient)
+
+    excerpt = asyncio.run(
+        EbayClient(_settings()).seller_hub_draft_result_excerpt("TASK-1")
+    )
+
+    assert excerpt.startswith("row,status")
+    assert FakeDraftResultAsyncClient.request_headers["Accept"] == (
+        "application/octet-stream"
+    )
+    assert "Content-Type" not in FakeDraftResultAsyncClient.request_headers
 
 
 def test_manual_images_cover_all_previously_blocked_sheet_rows():
