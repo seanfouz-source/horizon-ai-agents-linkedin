@@ -8,6 +8,7 @@ import secrets
 import time
 from datetime import date, datetime, timezone
 from html import escape
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -129,6 +130,19 @@ walmart_unpublished_status: dict[str, Any] = repository.latest_walmart_unpublish
 }
 app = FastAPI(title=settings.app_name)
 logger = logging.getLogger(__name__)
+LISTING_PHOTO_DIRECTORY = Path(__file__).with_name("listing_photos")
+LISTING_PHOTO_FILENAMES = {
+    "PHOTO-2026-07-24-13-09-52.jpg",
+    "PHOTO-2026-07-24-13-10-27.jpg",
+    "PHOTO-2026-07-24-13-10-59.jpg",
+    "PHOTO-2026-07-24-13-11-44.jpg",
+    "PHOTO-2026-07-24-13-17-29.jpg",
+    "PHOTO-2026-07-24-13-17-54.jpg",
+    "PHOTO-2026-07-24-13-18-22.jpg",
+    "PHOTO-2026-07-24-13-18-46.jpg",
+    "PHOTO-2026-07-24-13-19-13.jpg",
+    "PHOTO-2026-07-24-13-19-38.jpg",
+}
 
 
 def verify_secret(x_horizon_secret: str | None, query_secret: str | None = None) -> None:
@@ -817,6 +831,36 @@ def product_media(sku: str) -> Response:
         content=product_card_for_item(item),
         media_type="image/png",
         headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+def _listing_photo_path(filename: str) -> Path:
+    if filename not in LISTING_PHOTO_FILENAMES:
+        raise HTTPException(status_code=404, detail="Listing photo not found.")
+    path = LISTING_PHOTO_DIRECTORY / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Listing photo not found.")
+    return path
+
+
+@app.get("/media/listing-photos/{filename}")
+def listing_photo_media(filename: str) -> FileResponse:
+    return FileResponse(
+        _listing_photo_path(filename),
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
+
+
+@app.head("/media/listing-photos/{filename}")
+def listing_photo_media_head(filename: str) -> Response:
+    path = _listing_photo_path(filename)
+    return Response(
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "Content-Length": str(path.stat().st_size),
+        },
     )
 
 
