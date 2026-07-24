@@ -101,6 +101,17 @@ ebay_draft_status: dict[str, Any] = {
     "message": "The inventory-sheet eBay draft batch has not run yet.",
     "last_attempt_at": None,
 }
+ebay_seller_hub_draft_status: dict[str, Any] = (
+    repository.latest_ebay_seller_hub_draft_job()
+    or {
+        "status": "not_run",
+        "batch_id": None,
+        "requested_count": 0,
+        "success_count": 0,
+        "failure_count": 0,
+        "message": "The visible Seller Hub draft feed has not run yet.",
+    }
+)
 walmart_sync_status: dict[str, Any] = {
     "status": "not_run",
     "configured": walmart_client.configured,
@@ -135,6 +146,7 @@ def health() -> dict[str, Any]:
         "service": settings.app_name,
         "ebay_sync": ebay_sync_status,
         "ebay_drafts": ebay_draft_status,
+        "ebay_seller_hub_drafts": ebay_seller_hub_draft_status,
         "store_sync": store_syncer.last_status,
         "walmart_sync": walmart_sync_status,
         "walmart_drafts": {
@@ -291,6 +303,14 @@ async def _startup_inventory_refresh() -> None:
     if settings.sync_ebay_api_on_startup and _has_ebay_sync_credentials():
         api_status = await _sync_ebay_api_inventory()
     if api_status and api_status.get("status") == "ok":
+        seller_hub_batch_id = str(
+            settings.ebay_seller_hub_draft_batch_id or ""
+        ).strip()
+        if seller_hub_batch_id:
+            try:
+                await _submit_seller_hub_drafts_once(seller_hub_batch_id)
+            except Exception as exc:
+                logger.warning("eBay Seller Hub draft feed failed at startup: %s", exc)
         if settings.walmart_stage_drafts_on_startup and walmart_client.configured:
             try:
                 await _generate_walmart_drafts(
@@ -342,6 +362,108 @@ async def _sync_ebay_api_inventory() -> dict[str, Any]:
             "last_attempt_at": attempted_at,
         }
     return ebay_sync_status
+
+
+async def _submit_seller_hub_drafts_once(batch_id: str) -> dict[str, Any]:
+    global ebay_seller_hub_draft_status
+    clean_batch_id = str(batch_id or "").strip()
+    if not clean_batch_id:
+        raise ValueError("A non-empty eBay Seller Hub draft batch ID is required.")
+
+    existing = repository.ebay_seller_hub_draft_job(clean_batch_id)
+    terminal_statuses = {"COMPLETED", "COMPLETED_WITH_ERROR"}
+    if existing and str(existing.get("status") or "").upper() in terminal_statuses:
+        ebay_seller_hub_draft_status = existing
+        return existing
+
+    client = EbayClient(settings)
+    task_id = str((existing or {}).get("task_id") or "").strip()
+    requested_count = int((existing or {}).get("requested_count") or 0)
+    if not task_id:
+        drafts = inventory_sheet_missing_drafts()
+        submission = await client.submit_seller_hub_draft_feed(drafts, confirm=True)
+        if submission.get("status") != "submitted":
+            ebay_seller_hub_draft_status = (
+                repository.upsert_ebay_seller_hub_draft_job(
+                    clean_batch_id,
+                    status=str(submission.get("status") or "submission_failed"),
+                    task_id=submission.get("task_id"),
+                    requested_count=len(drafts),
+                    error_message=str(
+                        submission.get("message")
+                        or submission.get("error")
+                        or "The Seller Hub draft feed was not submitted."
+                    ),
+                )
+            )
+            return ebay_seller_hub_draft_status
+        task_id = str(submission["task_id"])
+        requested_count = len(drafts)
+        ebay_seller_hub_draft_status = (
+            repository.upsert_ebay_seller_hub_draft_job(
+                clean_batch_id,
+                status="SUBMITTED",
+                task_id=task_id,
+                requested_count=requested_count,
+            )
+        )
+
+    task_payload: dict[str, Any] = {}
+    for _ in range(45):
+        task_payload = await client.seller_hub_draft_task_status(task_id)
+        status = str(task_payload.get("status") or "UNKNOWN").upper()
+        upload_summary = task_payload.get("uploadSummary") or {}
+        success_count = int(
+            upload_summary.get("successCount")
+            or upload_summary.get("success")
+            or 0
+        )
+        failure_count = int(
+            upload_summary.get("failureCount")
+            or upload_summary.get("failure")
+            or 0
+        )
+        ebay_seller_hub_draft_status = (
+            repository.upsert_ebay_seller_hub_draft_job(
+                clean_batch_id,
+                status=status,
+                task_id=task_id,
+                requested_count=requested_count,
+                success_count=success_count,
+                failure_count=failure_count,
+            )
+        )
+        if status in terminal_statuses:
+            if status == "COMPLETED_WITH_ERROR" or failure_count:
+                try:
+                    result_excerpt = await client.seller_hub_draft_result_excerpt(
+                        task_id
+                    )
+                except (RuntimeError, httpx.HTTPError) as exc:
+                    result_excerpt = None
+                    error_message = (
+                        f"The result file could not be downloaded: {exc.__class__.__name__}."
+                    )
+                else:
+                    error_message = (
+                        f"eBay accepted {success_count} draft rows and rejected "
+                        f"{failure_count}."
+                    )
+                ebay_seller_hub_draft_status = (
+                    repository.upsert_ebay_seller_hub_draft_job(
+                        clean_batch_id,
+                        status=status,
+                        task_id=task_id,
+                        requested_count=requested_count,
+                        success_count=success_count,
+                        failure_count=failure_count,
+                        result_excerpt=result_excerpt,
+                        error_message=error_message,
+                    )
+                )
+            return ebay_seller_hub_draft_status
+        await asyncio.sleep(2)
+    return ebay_seller_hub_draft_status
 
 
 def _has_ebay_sync_credentials() -> bool:

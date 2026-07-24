@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     )
     ebay_store_max_pages: int = 3
     sync_ebay_api_on_startup: bool = True
+    ebay_seller_hub_draft_batch_id: str | None = None
     sync_store_page_on_startup: bool = True
     sync_inventory_before_social_posts: bool = True
     walmart_client_id: str | None = None

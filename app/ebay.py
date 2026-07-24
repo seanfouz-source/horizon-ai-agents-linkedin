@@ -1,8 +1,12 @@
 import asyncio
+import csv
+import gzip
 import hashlib
+import io
 import logging
 import re
 import xml.etree.ElementTree as ET
+import zipfile
 from base64 import b64encode
 from datetime import datetime, timezone
 from typing import Any
@@ -264,6 +268,196 @@ class EbayClient:
                     result["message"] = self._safe_http_error(exc)
                 results.append(result)
         return results
+
+    async def submit_seller_hub_draft_feed(
+        self,
+        drafts: list[EbayDraftSpec],
+        *,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        if not drafts:
+            raise ValueError("At least one eBay draft is required.")
+
+        image_urls_by_sku: dict[str, list[str]] = {}
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=60) as client:
+            await self._ensure_access_token(client)
+            for draft in drafts:
+                response = await self._get(
+                    client,
+                    f"/sell/inventory/v1/inventory_item/{quote(draft.sku, safe='')}",
+                    headers=self._headers(),
+                )
+                saved_urls: list[str] = []
+                if response.status_code == 200:
+                    raw_urls = ((response.json().get("product") or {}).get("imageUrls") or [])
+                    if isinstance(raw_urls, list):
+                        saved_urls = [
+                            str(url).replace(" ", "%20")
+                            for url in self._dedupe_urls(raw_urls)
+                            if str(url).lower().startswith("https://")
+                        ][:24]
+                if not saved_urls:
+                    saved_urls = [
+                        str(url).replace(" ", "%20")
+                        for url in self._dedupe_urls(draft.manual_image_urls)
+                        if str(url).lower().startswith("https://")
+                    ][:24]
+                image_urls_by_sku[draft.sku] = saved_urls
+
+            csv_text = self._seller_hub_draft_csv(drafts, image_urls_by_sku)
+            missing_images = [
+                draft.sku for draft in drafts if not image_urls_by_sku.get(draft.sku)
+            ]
+            preview = {
+                "status": "preview",
+                "requested_count": len(drafts),
+                "rows_with_images": len(drafts) - len(missing_images),
+                "missing_image_skus": missing_images,
+                "published": False,
+                "feed_type": "FX_LISTING",
+                "action": "Draft",
+            }
+            if not confirm:
+                return preview
+            if missing_images:
+                return {
+                    **preview,
+                    "status": "blocked_missing_images",
+                    "message": "The Seller Hub draft feed was not submitted because images are missing.",
+                }
+
+            task_response = await self._post_json(
+                client,
+                "/sell/feed/v1/task",
+                json_data={"feedType": "FX_LISTING", "schemaVersion": "1.0"},
+                headers=self._headers(),
+            )
+            if task_response.status_code != 202:
+                return {
+                    **preview,
+                    **self._response_error(task_response, "task_create_failed"),
+                }
+            location = str(task_response.headers.get("Location") or "").rstrip("/")
+            task_id = location.rsplit("/", 1)[-1] if location else ""
+            if not task_id:
+                return {
+                    **preview,
+                    "status": "task_create_failed",
+                    "http_status": task_response.status_code,
+                    "message": "eBay accepted the task but did not return a task ID.",
+                }
+
+            upload_headers = self._headers()
+            upload_headers.pop("Content-Type", None)
+            upload_response = await client.post(
+                f"/sell/feed/v1/task/{quote(task_id, safe='')}/upload_file",
+                files={
+                    "file": (
+                        "eBay-draft-listing-template-Horizon-Wireless.csv",
+                        csv_text.encode("utf-8-sig"),
+                        "text/csv",
+                    )
+                },
+                headers=upload_headers,
+            )
+            if upload_response.status_code != 200:
+                return {
+                    **preview,
+                    "task_id": task_id,
+                    **self._response_error(upload_response, "file_upload_failed"),
+                }
+            return {
+                **preview,
+                "status": "submitted",
+                "task_id": task_id,
+                "message": "Submitted a Seller Hub Draft feed. No listing publish action was used.",
+            }
+
+    async def seller_hub_draft_task_status(self, task_id: str) -> dict[str, Any]:
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=45) as client:
+            await self._ensure_access_token(client)
+            response = await self._get(
+                client,
+                f"/sell/feed/v1/task/{quote(str(task_id), safe='')}",
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def seller_hub_draft_result_excerpt(
+        self,
+        task_id: str,
+        *,
+        max_characters: int = 5000,
+    ) -> str:
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=60) as client:
+            await self._ensure_access_token(client)
+            response = await self._get(
+                client,
+                f"/sell/feed/v1/task/{quote(str(task_id), safe='')}/download_result_file",
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+            content = response.content
+        try:
+            if content.startswith(b"\x1f\x8b"):
+                content = gzip.decompress(content)
+            elif content.startswith(b"PK"):
+                with zipfile.ZipFile(io.BytesIO(content)) as archive:
+                    names = [name for name in archive.namelist() if not name.endswith("/")]
+                    if names:
+                        content = archive.read(names[0])
+        except (OSError, EOFError, zipfile.BadZipFile):
+            pass
+        text = content.decode("utf-8-sig", errors="replace")
+        return text[: max(0, int(max_characters))]
+
+    @staticmethod
+    def _seller_hub_draft_csv(
+        drafts: list[EbayDraftSpec],
+        image_urls_by_sku: dict[str, list[str]],
+    ) -> str:
+        headers = [
+            "Action",
+            "Custom label (SKU)",
+            "Category ID",
+            "Title",
+            "UPC",
+            "Price",
+            "Quantity",
+            "Item photo URL",
+            "Condition ID",
+            "Description",
+            "Format",
+        ]
+        output = io.StringIO(newline="")
+        writer = csv.writer(output, lineterminator="\r\n")
+        writer.writerow(
+            ["#INFO", "Version=1.0.0", "Template=eBay-draft-listing-template_US"]
+            + [""] * (len(headers) - 3)
+        )
+        writer.writerow(
+            ["#INFO", "Action=Draft", "SiteID=US", "Country=US", "Currency=USD"]
+            + [""] * (len(headers) - 5)
+        )
+        writer.writerow(headers)
+        for draft in drafts:
+            writer.writerow(
+                [
+                    "Draft",
+                    f"SH-{draft.sku}",
+                    draft.category_id,
+                    draft.title,
+                    "",
+                    f"{draft.price:.2f}",
+                    draft.quantity,
+                    "|".join(image_urls_by_sku.get(draft.sku) or []),
+                    "NEW" if draft.condition == "NEW" else "USED",
+                    draft.description,
+                    "FixedPrice",
+                ]
+            )
+        return output.getvalue()
 
     async def _search_catalog_products(
         self,

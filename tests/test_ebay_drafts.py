@@ -1,4 +1,6 @@
 import asyncio
+import csv
+import io
 from types import SimpleNamespace
 
 import httpx
@@ -39,6 +41,51 @@ def test_inventory_sheet_batch_contains_only_the_69_missing_variants():
     assert {draft.sheet_row for draft in drafts} == set(range(2, 73)) - {13, 54}
     assert len({draft.sku for draft in drafts}) == 69
     assert all(len(draft.title) <= 80 for draft in drafts)
+
+
+def test_seller_hub_draft_csv_uses_visible_draft_action_and_saved_images():
+    drafts = inventory_sheet_missing_drafts()
+    images = {
+        draft.sku: [f"https://i.ebayimg.com/images/g/{draft.sheet_row}/s-l1600.jpg"]
+        for draft in drafts
+    }
+
+    csv_text = EbayClient._seller_hub_draft_csv(drafts, images)
+    rows = list(csv.reader(io.StringIO(csv_text)))
+
+    assert rows[0][:3] == [
+        "#INFO",
+        "Version=1.0.0",
+        "Template=eBay-draft-listing-template_US",
+    ]
+    assert rows[1][:5] == [
+        "#INFO",
+        "Action=Draft",
+        "SiteID=US",
+        "Country=US",
+        "Currency=USD",
+    ]
+    assert rows[2] == [
+        "Action",
+        "Custom label (SKU)",
+        "Category ID",
+        "Title",
+        "UPC",
+        "Price",
+        "Quantity",
+        "Item photo URL",
+        "Condition ID",
+        "Description",
+        "Format",
+    ]
+    data_rows = rows[3:]
+    assert len(data_rows) == 69
+    assert {row[0] for row in data_rows} == {"Draft"}
+    assert all(row[1].startswith("SH-HW-WM-202607-") for row in data_rows)
+    assert all(row[4] == "" for row in data_rows)
+    assert all(row[7].startswith("https://i.ebayimg.com/") for row in data_rows)
+    assert {row[8] for row in data_rows} == {"NEW", "USED"}
+    assert {row[10] for row in data_rows} == {"FixedPrice"}
 
 
 def test_manual_images_cover_all_previously_blocked_sheet_rows():

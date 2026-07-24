@@ -110,6 +110,21 @@ CREATE TABLE IF NOT EXISTS walmart_unpublished_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_walmart_unpublished_jobs_status
 ON walmart_unpublished_jobs(status);
+
+CREATE TABLE IF NOT EXISTS ebay_seller_hub_draft_jobs (
+    batch_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    task_id TEXT,
+    requested_count INTEGER NOT NULL DEFAULT 0,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    failure_count INTEGER NOT NULL DEFAULT 0,
+    result_excerpt TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ebay_seller_hub_draft_jobs_status
+ON ebay_seller_hub_draft_jobs(status);
 """
 
 
@@ -557,6 +572,75 @@ class InventoryRepository:
                 """
             ).fetchone()
         return self._walmart_job_from_row(row) if row else None
+
+    def upsert_ebay_seller_hub_draft_job(
+        self,
+        batch_id: str,
+        *,
+        status: str,
+        task_id: str | None = None,
+        requested_count: int = 0,
+        success_count: int = 0,
+        failure_count: int = 0,
+        result_excerpt: str | None = None,
+        error_message: str | None = None,
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO ebay_seller_hub_draft_jobs (
+                    batch_id, status, task_id, requested_count,
+                    success_count, failure_count, result_excerpt,
+                    error_message, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(batch_id) DO UPDATE SET
+                    status = excluded.status,
+                    task_id = COALESCE(excluded.task_id, task_id),
+                    requested_count = CASE
+                        WHEN excluded.requested_count > 0 THEN excluded.requested_count
+                        ELSE requested_count
+                    END,
+                    success_count = excluded.success_count,
+                    failure_count = excluded.failure_count,
+                    result_excerpt = COALESCE(excluded.result_excerpt, result_excerpt),
+                    error_message = excluded.error_message,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(batch_id),
+                    str(status),
+                    task_id,
+                    int(requested_count),
+                    int(success_count),
+                    int(failure_count),
+                    result_excerpt,
+                    error_message,
+                    now,
+                    now,
+                ),
+            )
+        return self.ebay_seller_hub_draft_job(batch_id) or {}
+
+    def ebay_seller_hub_draft_job(self, batch_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM ebay_seller_hub_draft_jobs WHERE batch_id = ?",
+                (str(batch_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def latest_ebay_seller_hub_draft_job(self) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM ebay_seller_hub_draft_jobs
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
 
     def social_post_count_for_day(self, scheduled_day: date | str) -> int:
         day = scheduled_day.isoformat() if isinstance(scheduled_day, date) else str(scheduled_day)[:10]
