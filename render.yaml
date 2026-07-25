@@ -114,7 +114,7 @@ services:
     runtime: python
     plan: starter
     buildCommand: python --version
-    startCommand: python scripts/post_render_hourly_tasks.py
+    startCommand: python -m scripts.post_render_hourly_tasks
     schedule: "5 * * * *"
     envVars:
       - key: PYTHON_VERSION
