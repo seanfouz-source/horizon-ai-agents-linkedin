@@ -142,16 +142,21 @@ async def run(
         }
         for proposal in changed
     ]
-    revision_results = await client.revise_trading_listings(revisions)
+    revision_results, revision_failures = await apply_revisions_with_failures(
+        client,
+        revisions,
+    )
     revised_item_ids = [str(result["item_id"]) for result in revision_results]
-    verified_snapshots = await client.fetch_trading_listing_snapshots(
-        revised_item_ids
+    verified_snapshots = (
+        await client.fetch_trading_listing_snapshots(revised_item_ids)
+        if revised_item_ids
+        else []
     )
     verified_by_id = {
         str(snapshot.get("item_id")): snapshot for snapshot in verified_snapshots
     }
 
-    failures: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = list(revision_failures)
     for proposal in changed:
         item_id = str(proposal["item_id"])
         before = snapshots_by_id[item_id]
@@ -190,6 +195,8 @@ async def run(
     summary.update(
         {
             "revised": len(revision_results),
+            "revision_attempted": len(revisions),
+            "revision_failures": revision_failures,
             "verified": len(verified_snapshots),
             "prices_verified_unchanged": not any(
                 failure["error"] == "price_changed" for failure in failures
@@ -199,6 +206,27 @@ async def run(
     )
     print(f"{SUMMARY_PREFIX}={json.dumps(summary, sort_keys=True)}")
     return 1 if failures else 0
+
+
+async def apply_revisions_with_failures(
+    client: EbayClient,
+    revisions: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    results: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for revision in revisions:
+        item_id = str(revision.get("item_id") or "")
+        try:
+            results.extend(await client.revise_trading_listings([revision]))
+        except Exception as exc:
+            failures.append(
+                {
+                    "item_id": item_id,
+                    "error": "revision_failed",
+                    "message": str(exc),
+                }
+            )
+    return results, failures
 
 
 def emit_backup(backup: dict[str, Any], *, chunk_size: int = 9000) -> None:

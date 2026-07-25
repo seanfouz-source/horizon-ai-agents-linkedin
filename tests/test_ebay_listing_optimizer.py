@@ -6,7 +6,11 @@ from app.ebay_listing_optimizer import (
     listing_price_signature,
     propose_listing_optimization,
 )
-from scripts.optimize_ebay_listings import decode_backup_chunks, emit_backup
+from scripts.optimize_ebay_listings import (
+    apply_revisions_with_failures,
+    decode_backup_chunks,
+    emit_backup,
+)
 
 
 def _phone_snapshot(**overrides):
@@ -269,3 +273,32 @@ def test_backup_chunks_round_trip(capsys):
     ]
 
     assert decode_backup_chunks(chunks, manifest["sha256"]) == backup
+
+
+def test_apply_revisions_continues_after_individual_failure():
+    class FakeClient:
+        async def revise_trading_listings(self, revisions):
+            item_id = revisions[0]["item_id"]
+            if item_id == "blocked":
+                raise RuntimeError("picture policy")
+            return [{"item_id": item_id, "ack": "Success"}]
+
+    results, failures = __import__("asyncio").run(
+        apply_revisions_with_failures(
+            FakeClient(),
+            [
+                {"item_id": "first"},
+                {"item_id": "blocked"},
+                {"item_id": "last"},
+            ],
+        )
+    )
+
+    assert [result["item_id"] for result in results] == ["first", "last"]
+    assert failures == [
+        {
+            "item_id": "blocked",
+            "error": "revision_failed",
+            "message": "picture policy",
+        }
+    ]
