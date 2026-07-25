@@ -96,7 +96,7 @@ services:
       - key: METRICOOL_INVENTORY_POST_INTERVAL_HOURS
         value: "1"
       - key: METRICOOL_REPOST_COOLDOWN_DAYS
-        value: "6"
+        value: "5"
       - key: WEBHOOK_SHARED_SECRET
         generateValue: true
       - key: REPORT_EMAIL_PROVIDER
