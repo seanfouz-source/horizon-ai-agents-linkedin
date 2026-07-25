@@ -886,14 +886,128 @@ class EbayClient:
                     )
         return enriched
 
-    def _trading_headers(self) -> dict[str, str]:
+    async def list_active_trading_item_ids(self, limit: int = 200) -> list[str]:
+        """Return active seller listing IDs without expanding every Browse item."""
+        seller_username = str(
+            getattr(self.settings, "ebay_seller_username", "") or ""
+        ).strip()
+        if not seller_username:
+            return []
+
+        item_ids: list[str] = []
+        seen_item_ids: set[str] = set()
+        offset = 0
+        page_size = max(1, min(limit, 200))
+        query = getattr(self.settings, "ebay_browse_search_query", None)
+        if query is None or query == "":
+            query = " "
+
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=30) as client:
+            await self._ensure_access_token(client, prefer_application=True)
+            while len(item_ids) < limit:
+                response = await self._get(
+                    client,
+                    "/buy/browse/v1/item_summary/search",
+                    params={
+                        "q": query,
+                        "filter": f"sellers:{{{seller_username}}}",
+                        "limit": min(page_size, limit - len(item_ids)),
+                        "offset": offset,
+                    },
+                    headers=self._headers(),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                summaries = payload.get("itemSummaries", [])
+                if not summaries:
+                    break
+
+                for summary in summaries:
+                    if not isinstance(summary, dict):
+                        continue
+                    item_id = self._legacy_item_id(summary)
+                    if not item_id or item_id in seen_item_ids:
+                        continue
+                    seen_item_ids.add(item_id)
+                    item_ids.append(item_id)
+                    if len(item_ids) >= limit:
+                        break
+
+                offset += len(summaries)
+                if offset >= int(payload.get("total", offset)) or len(summaries) < page_size:
+                    break
+
+        return item_ids
+
+    async def fetch_trading_listing_snapshots(
+        self,
+        item_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        snapshots: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=45) as client:
+            await self._ensure_access_token(client)
+            for item_id in self._dedupe_urls([str(value) for value in item_ids]):
+                response = await self._post_content(
+                    client,
+                    "/ws/api.dll",
+                    content=self._trading_get_item_request(item_id),
+                    headers=self._trading_headers("GetItem"),
+                )
+                response.raise_for_status()
+                snapshots.append(self._parse_trading_listing_snapshot(response.content))
+        return snapshots
+
+    async def revise_trading_listings(
+        self,
+        revisions: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Revise listing metadata only; pricing is intentionally unsupported."""
+        results: list[dict[str, Any]] = []
+        if not revisions:
+            return results
+
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=45) as client:
+            await self._ensure_access_token(client)
+            for revision in revisions:
+                item_id = str(revision.get("item_id") or "").strip()
+                listing_type = str(revision.get("listing_type") or "")
+                has_variations = bool(revision.get("has_variations"))
+                call_name = (
+                    "ReviseFixedPriceItem"
+                    if has_variations or "fixedprice" in listing_type.casefold()
+                    else "ReviseItem"
+                )
+                request_payload = self._trading_revise_listing_request(
+                    call_name=call_name,
+                    item_id=item_id,
+                    title=str(revision.get("title") or "").strip() or None,
+                    item_specifics=revision.get("item_specifics"),
+                )
+                response = await self._post_content(
+                    client,
+                    "/ws/api.dll",
+                    content=request_payload,
+                    headers=self._trading_headers(call_name),
+                )
+                response.raise_for_status()
+                result = self._parse_trading_ack(response.content)
+                result.update({"item_id": item_id, "call_name": call_name})
+                if result["ack"] not in {"Success", "Warning"}:
+                    raise RuntimeError(
+                        f"eBay {call_name} failed for {item_id}: "
+                        f"{'; '.join(result['messages']) or result['ack']}"
+                    )
+                results.append(result)
+        return results
+
+    def _trading_headers(self, call_name: str = "GetItem") -> dict[str, str]:
         compatibility_level = str(
             getattr(self.settings, "ebay_trading_compatibility_level", "1455") or "1455"
         ).strip()
         return {
             "Content-Type": "text/xml;charset=UTF-8",
             "X-EBAY-API-IAF-TOKEN": str(self._access_token or ""),
-            "X-EBAY-API-CALL-NAME": "GetItem",
+            "X-EBAY-API-CALL-NAME": call_name,
             "X-EBAY-API-SITEID": "0",
             "X-EBAY-API-COMPATIBILITY-LEVEL": compatibility_level,
         }
@@ -905,6 +1019,155 @@ class EbayClient:
         ET.SubElement(root, "DetailLevel").text = "ReturnAll"
         ET.SubElement(root, "IncludeItemSpecifics").text = "true"
         return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    @classmethod
+    def _parse_trading_listing_snapshot(cls, payload: bytes | str) -> dict[str, Any]:
+        raw_xml = payload.decode("utf-8") if isinstance(payload, bytes) else payload
+        root = ET.fromstring(raw_xml)
+        ack = cls._xml_text(root, "Ack") or "Failure"
+        if ack not in {"Success", "Warning"}:
+            messages = [
+                cls._xml_text(error, "LongMessage") or cls._xml_text(error, "ShortMessage")
+                for error in cls._xml_children(root, "Errors")
+            ]
+            raise ValueError("; ".join(message for message in messages if message) or ack)
+
+        item = cls._xml_child(root, "Item")
+        if item is None:
+            raise ValueError("eBay Trading API response did not include an Item.")
+
+        variations = cls._xml_child(item, "Variations")
+        variation_rows: list[dict[str, Any]] = []
+        for variation in cls._xml_children(variations, "Variation"):
+            variation_rows.append(
+                {
+                    "sku": cls._xml_text(variation, "SKU"),
+                    "specifics": cls._xml_name_value_lists(
+                        cls._xml_child(variation, "VariationSpecifics")
+                    ),
+                    "start_price": cls._xml_money(cls._xml_child(variation, "StartPrice")),
+                }
+            )
+
+        variation_names = [
+            value
+            for value in cls._xml_child_texts(
+                cls._xml_nested_child(variations, "VariationSpecificsSet"),
+                "Name",
+            )
+            if value
+        ]
+        picture_urls = cls._xml_child_texts(
+            cls._xml_child(item, "PictureDetails"),
+            "PictureURL",
+        )
+        for pictures in cls._xml_children(variations, "Pictures"):
+            for picture_set in cls._xml_children(
+                pictures,
+                "VariationSpecificPictureSet",
+            ):
+                picture_urls.extend(
+                    cls._xml_child_texts(picture_set, "PictureURL")
+                )
+        return {
+            "item_id": cls._xml_text(item, "ItemID"),
+            "title": cls._xml_text(item, "Title") or "",
+            "listing_type": cls._xml_text(item, "ListingType") or "",
+            "condition_id": cls._xml_text(item, "ConditionID"),
+            "condition": cls._xml_text(item, "ConditionDisplayName"),
+            "category_id": cls._xml_nested_text(item, "PrimaryCategory", "CategoryID"),
+            "category_name": cls._xml_nested_text(item, "PrimaryCategory", "CategoryName"),
+            "item_specifics": cls._xml_name_value_lists(
+                cls._xml_child(item, "ItemSpecifics")
+            ),
+            "picture_urls": cls._dedupe_urls(picture_urls),
+            "has_variations": bool(variation_rows),
+            "variation_specific_names": variation_names,
+            "prices": {
+                "start_price": cls._xml_money(cls._xml_child(item, "StartPrice")),
+                "current_price": cls._xml_money(
+                    cls._xml_nested_child(item, "SellingStatus", "CurrentPrice")
+                ),
+                "variations": variation_rows,
+            },
+            "raw_xml": raw_xml,
+        }
+
+    @staticmethod
+    def _trading_revise_listing_request(
+        *,
+        call_name: str,
+        item_id: str,
+        title: str | None,
+        item_specifics: list[dict[str, Any]] | None,
+    ) -> bytes:
+        if call_name not in {"ReviseFixedPriceItem", "ReviseItem"}:
+            raise ValueError(f"Unsupported eBay Trading API revision call: {call_name}")
+        if not item_id:
+            raise ValueError("An eBay item ID is required.")
+        if not title and item_specifics is None:
+            raise ValueError("A title or item-specific revision is required.")
+
+        root = ET.Element(
+            f"{call_name}Request",
+            xmlns="urn:ebay:apis:eBLBaseComponents",
+        )
+        item = ET.SubElement(root, "Item")
+        ET.SubElement(item, "ItemID").text = item_id
+        if title:
+            ET.SubElement(item, "Title").text = title[:80]
+        if item_specifics is not None:
+            specifics_node = ET.SubElement(item, "ItemSpecifics")
+            for entry in item_specifics:
+                name = str(entry.get("name") or "").strip()
+                values = [
+                    str(value).strip()
+                    for value in entry.get("values") or []
+                    if str(value).strip()
+                ]
+                if not name or not values:
+                    continue
+                name_value = ET.SubElement(specifics_node, "NameValueList")
+                ET.SubElement(name_value, "Name").text = name
+                for value in values:
+                    ET.SubElement(name_value, "Value").text = value
+        ET.SubElement(root, "ErrorLanguage").text = "en_US"
+        ET.SubElement(root, "WarningLevel").text = "High"
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    @classmethod
+    def _parse_trading_ack(cls, payload: bytes | str) -> dict[str, Any]:
+        root = ET.fromstring(payload)
+        messages = [
+            cls._xml_text(error, "LongMessage") or cls._xml_text(error, "ShortMessage")
+            for error in cls._xml_children(root, "Errors")
+        ]
+        return {
+            "ack": cls._xml_text(root, "Ack") or "Failure",
+            "messages": [message for message in messages if message],
+        }
+
+    @classmethod
+    def _xml_name_value_lists(
+        cls,
+        parent: ET.Element | None,
+    ) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for name_value in cls._xml_children(parent, "NameValueList"):
+            name = cls._xml_text(name_value, "Name")
+            values = cls._xml_child_texts(name_value, "Value")
+            if name and values:
+                entries.append({"name": name, "values": values})
+        return entries
+
+    @staticmethod
+    def _xml_money(node: ET.Element | None) -> dict[str, str] | None:
+        if node is None or node.text is None:
+            return None
+        return {
+            "value": node.text.strip(),
+            "currency": str(node.attrib.get("currencyID") or ""),
+        }
 
     def _parse_trading_get_item(
         self,
