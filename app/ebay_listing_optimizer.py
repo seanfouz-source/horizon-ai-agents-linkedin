@@ -10,6 +10,36 @@ from typing import Any
 PHONE_CATEGORY_ID = "9355"
 SPEAKER_CATEGORY_ID = "111694"
 OPEN_BOX_LABEL = "Open Box"
+KNOWN_COLOR_PHRASES = (
+    "Titanium Silverblue",
+    "Titanium Whitesilver",
+    "Titanium Black",
+    "Titanium Gray",
+    "Pacific Blue",
+    "Space Black",
+    "(PRODUCT)RED",
+    "Various Colors",
+    "Slipstream",
+    "Starlight",
+    "Midnight",
+    "Graphite",
+    "Lavender",
+    "Burgundy",
+    "Silver",
+    "Purple",
+    "Yellow",
+    "White",
+    "Black",
+    "Cream",
+    "Green",
+    "Gray",
+    "Grey",
+    "Gold",
+    "Navy",
+    "Blue",
+    "Pink",
+    "Red",
+)
 
 
 def propose_listing_optimization(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -173,8 +203,10 @@ def _phone_title(
 ) -> str | None:
     model = _first_fact(facts, "Model")
     storage = _compact_capacity(_first_fact(facts, "Storage Capacity"))
-    color = _first_fact(facts, "Color")
+    color = _color_from_title(current_title) or _first_fact(facts, "Color")
     lock_status = _first_fact(facts, "Lock Status")
+    if not lock_status and _first_fact(facts, "Network").casefold() == "unlocked":
+        lock_status = "Unlocked"
     if not model:
         return None
 
@@ -241,6 +273,13 @@ def _clean_existing_title(title: str, condition: str) -> str:
     candidate = title.replace("–", " ").replace("—", " ")
     candidate = re.sub(r"\s+-\s+", " ", candidate)
     candidate = re.sub(
+        r"\s*-\s*(?=Wi-?Fi\b)",
+        " ",
+        candidate,
+        flags=re.IGNORECASE,
+    )
+    candidate = re.sub(r"\bWiFi\b", "Wi-Fi", candidate, flags=re.IGNORECASE)
+    candidate = re.sub(
         r"\b(\d{2,4})\s+GB\b",
         lambda match: f"{match.group(1)}GB",
         candidate,
@@ -296,6 +335,13 @@ def _first_fact(facts: dict[str, list[str]], name: str) -> str:
 
 def _compact_capacity(value: str) -> str:
     return re.sub(r"\b(\d{2,4})\s+GB\b", r"\1GB", value, flags=re.IGNORECASE)
+
+
+def _color_from_title(title: str) -> str:
+    for color in KNOWN_COLOR_PHRASES:
+        if _contains_phrase(title, color):
+            return color
+    return ""
 
 
 def _contains_phrase(haystack: str, needle: str) -> bool:

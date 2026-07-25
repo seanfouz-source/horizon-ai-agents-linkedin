@@ -77,6 +77,7 @@ async def run(
                 "item_id": snapshot.get("item_id"),
                 "title": snapshot.get("title"),
                 "listing_type": snapshot.get("listing_type"),
+                "has_variations": snapshot.get("has_variations"),
                 "condition": snapshot.get("condition"),
                 "category_id": snapshot.get("category_id"),
                 "category_name": snapshot.get("category_name"),

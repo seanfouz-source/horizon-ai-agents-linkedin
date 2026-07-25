@@ -121,6 +121,41 @@ def test_generic_title_cleanup_preserves_wifi_hyphen():
     assert proposal["proposed_title"].endswith("Open Box")
 
 
+def test_phone_title_preserves_title_color_when_specific_conflicts():
+    proposal = propose_listing_optimization(
+        {
+            **_phone_snapshot(),
+            "title": "Galaxy S25 Blue 128gb Open Box-Unlocked",
+            "item_specifics": [
+                {"name": "Brand", "values": ["Samsung"]},
+                {"name": "Model", "values": ["Samsung Galaxy S25"]},
+                {"name": "Storage Capacity", "values": ["128 GB"]},
+                {"name": "Color", "values": ["Black"]},
+                {"name": "Network", "values": ["Unlocked"]},
+            ],
+        }
+    )
+
+    assert proposal["proposed_title"] == (
+        "Samsung Galaxy S25 128GB Blue Unlocked Open Box"
+    )
+
+
+def test_generic_title_cleanup_normalizes_attached_wifi_separator():
+    proposal = propose_listing_optimization(
+        {
+            **_phone_snapshot(),
+            "title": "Samsung Galaxy Tab A11+ -Wifi + Cellular 5G",
+            "category_id": "171485",
+            "item_specifics": [],
+        }
+    )
+
+    assert proposal["proposed_title"] == (
+        "Samsung Galaxy Tab A11+ Wi-Fi + Cellular 5G Open Box"
+    )
+
+
 def test_distinct_ebay_photo_count_collapses_size_variants():
     urls = [
         "https://i.ebayimg.com/00/s/MTIwMFgxNjAw/z/example/$_1.JPG?set_id=123",
