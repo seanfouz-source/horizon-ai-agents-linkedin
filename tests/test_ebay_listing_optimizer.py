@@ -75,6 +75,25 @@ def test_optimizer_adds_only_title_supported_missing_specifics():
     )
 
 
+def test_optimizer_does_not_duplicate_aspects_on_variation_listing():
+    proposal = propose_listing_optimization(
+        _phone_snapshot(
+            has_variations=True,
+            title=(
+                "Apple iPhone 16 Plus 128GB / 256GB / 512GB "
+                "Factory Unlocked Open Box"
+            ),
+            item_specifics=[
+                {"name": "Brand", "values": ["Apple"]},
+                {"name": "Model", "values": ["Apple iPhone 16 Plus"]},
+            ],
+        )
+    )
+
+    assert proposal["item_specifics_changed"] is False
+    assert proposal["item_specific_additions"] == []
+
+
 def test_optimizer_corrects_new_open_box_title_contradiction():
     proposal = propose_listing_optimization(
         {

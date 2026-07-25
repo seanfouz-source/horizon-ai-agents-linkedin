@@ -49,6 +49,7 @@ def propose_listing_optimization(snapshot: dict[str, Any]) -> dict[str, Any]:
         original_specifics,
         title=original_title,
         category_id=str(snapshot.get("category_id") or ""),
+        has_variations=bool(snapshot.get("has_variations")),
     )
     proposed_title = _optimized_title(
         title=original_title,
@@ -129,8 +130,11 @@ def _add_truthful_item_specifics(
     *,
     title: str,
     category_id: str,
+    has_variations: bool,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     proposed = deepcopy(item_specifics)
+    if has_variations:
+        return proposed, []
     index = {
         _normalized_name(str(entry.get("name") or "")): entry
         for entry in proposed

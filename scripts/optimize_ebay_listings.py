@@ -157,8 +157,11 @@ async def run(
     }
 
     failures: list[dict[str, Any]] = list(revision_failures)
+    revised_item_id_set = set(revised_item_ids)
     for proposal in changed:
         item_id = str(proposal["item_id"])
+        if item_id not in revised_item_id_set:
+            continue
         before = snapshots_by_id[item_id]
         after = verified_by_id.get(item_id)
         if after is None:
