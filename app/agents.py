@@ -1403,7 +1403,12 @@ def _inventory_items_for_daily_promotion(
     if request.sku:
         item = repository.get(request.sku)
         candidates = [item] if item and _is_active_promotable_item(item) and _is_ebay_listing(item) else []
-        return _rotate_inventory_items(repository, candidates, requested_limit)
+        return _rotate_inventory_items(
+            repository,
+            candidates,
+            requested_limit,
+            ignore_recent_history=request.ignore_recent_history,
+        )
     query = request.query.strip().lower() if request.query else ""
     if query in {"all phones", "phones"}:
         candidates = [
@@ -1411,14 +1416,25 @@ def _inventory_items_for_daily_promotion(
             for item in repository.all_promotable(limit=candidate_limit)
             if _is_ebay_listing(item) and _looks_like_phone(item)
         ]
-        return _rotate_inventory_items(repository, candidates, requested_limit)
+        return _rotate_inventory_items(
+            repository,
+            candidates,
+            requested_limit,
+            ignore_recent_history=request.ignore_recent_history,
+        )
     if query and query not in {"all", "all inventory", "daily inventory"}:
         candidates = [item for item in repository.search(request.query, limit=candidate_limit) if _is_ebay_listing(item)]
-        return _rotate_inventory_items(repository, candidates, requested_limit)
+        return _rotate_inventory_items(
+            repository,
+            candidates,
+            requested_limit,
+            ignore_recent_history=request.ignore_recent_history,
+        )
     return _rotate_inventory_items(
         repository,
         [item for item in repository.all_promotable(limit=candidate_limit) if _is_ebay_listing(item)],
         requested_limit,
+        ignore_recent_history=request.ignore_recent_history,
     )
 
 
@@ -1426,6 +1442,8 @@ def _rotate_inventory_items(
     repository: InventoryRepository,
     items: list[InventoryItem],
     limit: int,
+    *,
+    ignore_recent_history: bool = False,
 ) -> list[InventoryItem]:
     active_items = []
     for item in items:
@@ -1434,7 +1452,7 @@ def _rotate_inventory_items(
             _log_skipped_inventory_post(item, skip_reason)
             continue
         active_items.append(item)
-    if not _repository_supports_post_history(repository):
+    if ignore_recent_history or not _repository_supports_post_history(repository):
         return active_items[:limit]
 
     settings = get_settings()

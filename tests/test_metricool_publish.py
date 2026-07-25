@@ -118,3 +118,47 @@ def test_schedule_metricool_payloads_reports_item_errors_without_aborting_batch(
     assert results[0]["status"] == "failed"
     assert results[0]["product_sku"] == "EBAY-1"
     assert "HTTP 400" in str(results[0]["error"])
+
+
+def test_schedule_metricool_payloads_accepts_plain_text_normalized_media_url():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/actions/normalize/image/url":
+            return httpx.Response(
+                200,
+                text="https://static.metricool.com/plain-text-product.jpg",
+                headers={"Content-Type": "text/plain"},
+            )
+        if request.url.path == "/api/v2/scheduler/posts":
+            body = json.loads(request.content)
+            assert body["media"] == [
+                "https://static.metricool.com/plain-text-product.jpg"
+            ]
+            return httpx.Response(
+                200,
+                json={"data": {"id": 67890, "providers": body["providers"]}},
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    async def run() -> list[dict[str, object]]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await schedule_metricool_payloads(
+                [
+                    {
+                        "publication_date_time": "2026-07-25 11:00:00",
+                        "post_content": "Shop now",
+                        "media_01": "https://i.ebayimg.com/product.jpg",
+                        "facebook": True,
+                    }
+                ],
+                settings=Settings(
+                    metricool_api_token="token",
+                    metricool_blog_id=6278196,
+                    metricool_user_id=4838974,
+                ),
+                client=client,
+            )
+
+    results = asyncio.run(run())
+
+    assert results[0]["status"] == "scheduled"
+    assert results[0]["metricool_post_id"] == 67890

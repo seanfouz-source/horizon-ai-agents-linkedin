@@ -1529,6 +1529,7 @@ async def schedule_inventory_rotation(
 
     draft_request = SocialDraftRequest(
         promote_all_inventory=True,
+        ignore_recent_history=bool(body.get("ignore_recent_history", False)),
         query="all inventory",
         max_products_per_run=min(max(int(body.get("max_products_per_run", 200)), 1), 200),
         platforms=["facebook", "instagram", "tiktok", "linkedin"],

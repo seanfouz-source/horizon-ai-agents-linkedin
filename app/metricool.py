@@ -247,6 +247,9 @@ async def _metricool_request(
     try:
         return response.json()
     except ValueError as exc:
+        text_response = response.text.strip()
+        if text_response.startswith(("http://", "https://")):
+            return text_response
         raise MetricoolPublishError(f"Metricool {path} did not return JSON.") from exc
 
 
