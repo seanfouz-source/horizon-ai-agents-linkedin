@@ -34,15 +34,15 @@ class FakeRepository:
         return next((item for item in self.items if item.sku == sku), None)
 
 
-def inventory_two_hour_slots(count, start_at=None):
+def inventory_hourly_slots(count, start_at=None):
     base = datetime.fromisoformat(start_at or "2026-07-02 09:00:00")
     return [
-        (base + timedelta(hours=2 * index)).strftime("%Y-%m-%d %H:%M:%S")
+        (base + timedelta(hours=index)).strftime("%Y-%m-%d %H:%M:%S")
         for index in range(count)
     ]
 
 
-def test_inventory_publication_times_schedule_every_two_hours_during_daytime():
+def test_inventory_publication_times_schedule_every_hour_during_daytime():
     central = ZoneInfo("America/Chicago")
 
     publication_times = agents_module._inventory_metricool_publication_times(
@@ -53,18 +53,18 @@ def test_inventory_publication_times_schedule_every_two_hours_during_daytime():
     assert len(publication_times) == 19
     assert publication_times[:4] == [
         "2026-07-02 09:00:00",
+        "2026-07-02 10:00:00",
         "2026-07-02 11:00:00",
-        "2026-07-02 13:00:00",
-        "2026-07-02 15:00:00",
+        "2026-07-02 12:00:00",
     ]
-    assert publication_times[6:9] == [
+    assert publication_times[12:15] == [
         "2026-07-02 21:00:00",
         "2026-07-03 09:00:00",
-        "2026-07-03 11:00:00",
+        "2026-07-03 10:00:00",
     ]
-    assert publication_times[-1] == "2026-07-04 17:00:00"
+    assert publication_times[-1] == "2026-07-03 14:00:00"
     assert all(
-        value[11:16] in {"09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00"}
+        value[11:16] in {f"{hour:02d}:00" for hour in range(9, 22)}
         for value in publication_times
     )
 
@@ -79,7 +79,7 @@ def test_inventory_publication_times_roll_to_next_morning_after_last_slot():
 
     assert publication_times == [
         "2026-07-03 09:00:00",
-        "2026-07-03 11:00:00",
+        "2026-07-03 10:00:00",
     ]
 
 
@@ -554,7 +554,7 @@ def test_all_inventory_mode_records_history_without_same_day_duplicates(tmp_path
     monkeypatch.setattr(
         agents_module,
         "_inventory_metricool_publication_times",
-        inventory_two_hour_slots,
+        inventory_hourly_slots,
     )
 
     request = SocialDraftRequest(
@@ -570,13 +570,13 @@ def test_all_inventory_mode_records_history_without_same_day_duplicates(tmp_path
 
     assert [payload["publication_date_time"] for payload in first_batch.metricool_payloads] == [
         "2026-07-02 09:00:00",
+        "2026-07-02 10:00:00",
         "2026-07-02 11:00:00",
-        "2026-07-02 13:00:00",
     ]
     assert repository.social_post_count_for_day("2026-07-02") == 3
     assert repository.social_post_count_for_hour("2026-07-02 09") == 1
+    assert repository.social_post_count_for_hour("2026-07-02 10") == 1
     assert repository.social_post_count_for_hour("2026-07-02 11") == 1
-    assert repository.social_post_count_for_hour("2026-07-02 13") == 1
 
     second_batch = asyncio.run(agents_module.create_social_drafts(request))
 
@@ -704,7 +704,7 @@ def test_all_inventory_mode_matches_composite_ebay_ids_to_history(tmp_path, monk
     monkeypatch.setattr(
         agents_module,
         "_inventory_metricool_publication_times",
-        inventory_two_hour_slots,
+        inventory_hourly_slots,
     )
 
     batch = asyncio.run(
@@ -802,7 +802,7 @@ def test_all_inventory_mode_respects_existing_hourly_history(tmp_path, monkeypat
     monkeypatch.setattr(
         agents_module,
         "_inventory_metricool_publication_times",
-        inventory_two_hour_slots,
+        inventory_hourly_slots,
     )
 
     batch = asyncio.run(
@@ -816,4 +816,4 @@ def test_all_inventory_mode_respects_existing_hourly_history(tmp_path, monkeypat
         )
     )
 
-    assert [payload["publication_date_time"] for payload in batch.metricool_payloads] == ["2026-07-02 11:00:00"]
+    assert [payload["publication_date_time"] for payload in batch.metricool_payloads] == ["2026-07-02 10:00:00"]

@@ -61,7 +61,7 @@ This is a starter agent hub for promoting an eBay store and answering product qu
 - `POST /webhooks/zapier/social-drafts` creates Facebook, Instagram, and TikTok post drafts.
 - `POST /webhooks/zapier/slow-mover-outreach` creates engagement-first posts for stale eBay items.
 - `POST /webhooks/metricool/inbox` answers Metricool inbox/comment events routed through Zapier.
-- `POST /webhooks/metricool/schedule-inventory` refreshes active eBay inventory and directly fills Metricool's planner with the every-two-hours rotation. The existing Render daily job calls it automatically.
+- `POST /webhooks/metricool/schedule-inventory` refreshes active eBay inventory and sends the next hourly rotation post, including its eBay image, directly from Render to Metricool.
 - `GET /reports/daily` returns a daily Metricool effectiveness report.
 - `GET /reports/daily.md` returns the same report as email-ready Markdown.
 - `GET /reports/daily.pdf` returns a polished PDF attachment.
@@ -122,17 +122,17 @@ GitHub Actions can send the same report without Zapier:
 3. Required GitHub Secrets: `SMTP_HOST`, `SMTP_USERNAME`, and `SMTP_PASSWORD`.
 4. Optional GitHub Secrets or Variables: `SMTP_PORT`, `SMTP_SECURITY`, `REPORT_BASE_URL`, `REPORT_EMAIL_TO`, `REPORT_EMAIL_FROM`, `REPORT_EMAIL_FROM_NAME`, and `WEBHOOK_SHARED_SECRET`.
 
-Render can send the same report without Zapier or GitHub:
+Render handles the hourly inventory rotation and daily report without Zapier or GitHub:
 
-1. The `render.yaml` blueprint includes a `horizon-daily-report-email` Cron Job scheduled at `0 15 * * *` (9:00 AM CST / 10:00 AM CDT), after Metricool's overnight sync window.
-2. To send from Gmail, set `REPORT_EMAIL_PROVIDER=gmail`, `REPORT_EMAIL_FROM=sean.fouz@gmail.com`, and `GMAIL_SENDER=sean.fouz@gmail.com`.
-3. Add Google OAuth variables to the web service in Render: `GMAIL_CLIENT_ID` plus either `GMAIL_CLIENT_SECRET`, `GMAIL_CLIENT_SECRET_FILE`, or `GMAIL_CLIENT_CREDENTIALS_FILE`. A Google OAuth JSON secret file can also be uploaded to Render as a secret file; Render mounts it at `/etc/secrets/<filename>`.
-4. Add `https://horizon-ai-agents.onrender.com` as the Google OAuth JavaScript origin and `https://horizon-ai-agents.onrender.com/oauth2callback` as the authorized redirect URI.
-5. Open `/gmail/oauth/start?secret=YOUR_WEBHOOK_SHARED_SECRET` on the Render web service, approve Gmail access, then copy the returned `GMAIL_REFRESH_TOKEN_CURRENT` value into the Render web service environment.
-6. Copy the same `WEBHOOK_SHARED_SECRET` value from the web service into the `horizon-daily-report-email` Cron Job environment so the cron can call the protected email endpoint.
-7. In Google Cloud, keep the OAuth consent screen published/in production for long-lived Gmail refresh tokens. Google expires refresh tokens after 7 days when an external OAuth app is left in Testing and requests scopes beyond basic profile/email/openid.
-8. To check the live Gmail configuration without exposing secrets, open `/gmail/oauth/status?secret=YOUR_WEBHOOK_SHARED_SECRET&test_refresh=true`. It reports token/client fingerprints and whether Google accepts the refresh token.
-9. The Cron Job runs `python scripts/post_render_daily_report_email.py`, which calls `POST https://horizon-ai-agents.onrender.com/reports/daily/email` and prints any error response body while Gmail and Metricool credentials stay on the web service.
+1. The existing `horizon-daily-report-email` Cron Job is retained so its shared secret stays configured, but it now runs `scripts/post_render_hourly_tasks.py` at minute 5 of every hour.
+2. Every run refreshes active inventory through the eBay API and sends one listing image and post directly to Metricool. At 15:05 UTC, the same run also sends the daily report after Metricool's overnight sync window.
+3. Copy the web service's `WEBHOOK_SHARED_SECRET` value into the Cron Job so it can call the protected endpoints.
+4. To send from Gmail, set `REPORT_EMAIL_PROVIDER=gmail`, `REPORT_EMAIL_FROM=sean.fouz@gmail.com`, and `GMAIL_SENDER=sean.fouz@gmail.com`.
+5. Add Google OAuth variables to the web service in Render: `GMAIL_CLIENT_ID` plus either `GMAIL_CLIENT_SECRET`, `GMAIL_CLIENT_SECRET_FILE`, or `GMAIL_CLIENT_CREDENTIALS_FILE`. A Google OAuth JSON secret file can also be uploaded to Render as a secret file; Render mounts it at `/etc/secrets/<filename>`.
+6. Add `https://horizon-ai-agents.onrender.com` as the Google OAuth JavaScript origin and `https://horizon-ai-agents.onrender.com/oauth2callback` as the authorized redirect URI.
+7. Open `/gmail/oauth/start?secret=YOUR_WEBHOOK_SHARED_SECRET` on the Render web service, approve Gmail access, then copy the returned `GMAIL_REFRESH_TOKEN_CURRENT` value into the Render web service environment.
+8. In Google Cloud, keep the OAuth consent screen published/in production for long-lived Gmail refresh tokens. Google expires refresh tokens after 7 days when an external OAuth app is left in Testing and requests scopes beyond basic profile/email/openid.
+9. To check the live Gmail configuration without exposing secrets, open `/gmail/oauth/status?secret=YOUR_WEBHOOK_SHARED_SECRET&test_refresh=true`. It reports token/client fingerprints and whether Google accepts the refresh token.
 10. For a manual test from the live web service, `POST /reports/daily/email?dry_run=true` prepares the email, and `POST /reports/daily/email` sends it.
 
 Example social draft request:
@@ -154,12 +154,11 @@ Example social draft request:
 ```
 
 When `promote_all_inventory` is true, the app creates one Metricool payload per
-eligible active eBay listing, using an Instagram-safe square version of the eBay
-store's July Summer Sale banner as the default campaign media. If `sale_media_url` and `media_url` are omitted, the
-app falls back to the selected eBay product image when available. Metricool remains the public social scheduler; the app only prepares
-Metricool-ready payloads and records local scheduling history to prevent reruns
-from duplicating posts. All-inventory campaigns rotate one listing every two
-hours from 09:00 through 21:00 Central time, including weekends. The start time
+eligible active eBay listing and uses the listing's current eBay product image.
+The production Render route normalizes that image with Metricool and creates the
+planner post directly, without a Zapier image step. Local scheduling history
+prevents reruns from duplicating posts. All-inventory campaigns rotate one listing
+every hour from 09:00 through 21:00 Central time, including weekends. The start time
 uses `METRICOOL_MORNING_POST_TIME`; the end and interval use
 `METRICOOL_INVENTORY_POST_END_TIME` and
 `METRICOOL_INVENTORY_POST_INTERVAL_HOURS`. Other social campaigns keep the

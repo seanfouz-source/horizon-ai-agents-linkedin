@@ -41,7 +41,7 @@ from app.models import (
 logger = logging.getLogger(__name__)
 INVENTORY_ROTATION_CANDIDATE_LIMIT = 200
 INVENTORY_POSTS_PER_HOUR = 1
-INVENTORY_POSTING_INTERVAL = timedelta(hours=2)
+INVENTORY_POSTING_INTERVAL = timedelta(hours=1)
 INVENTORY_DEFAULT_START_TIME = time(9, 0)
 INVENTORY_DEFAULT_END_TIME = time(21, 0)
 
@@ -1061,8 +1061,8 @@ async def _create_all_inventory_social_drafts(request: SocialDraftRequest) -> So
         posts=posts,
         notes=(
             f"Generated {len(posts)} scheduled Summer Sale post payloads from {len(items)} in-stock inventory items. "
-            "Use the metricool_*_items fields or loop over metricool_payloads in Zapier to schedule every item "
-            "at the every-two-hours daytime Metricool cadence until the active inventory runs out."
+            "Render sends the eBay listing image and post directly to Metricool at the hourly daytime cadence "
+            "until the active inventory rotation runs out; Zapier is not part of this publishing path."
         ),
     )
     batch.metricool_payloads = [metricool_payload(post, request) for post in batch.posts]

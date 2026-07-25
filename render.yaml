@@ -94,7 +94,7 @@ services:
       - key: METRICOOL_INVENTORY_POST_END_TIME
         value: "21:00"
       - key: METRICOOL_INVENTORY_POST_INTERVAL_HOURS
-        value: "2"
+        value: "1"
       - key: METRICOOL_REPOST_COOLDOWN_DAYS
         value: "14"
       - key: WEBHOOK_SHARED_SECRET
@@ -114,10 +114,12 @@ services:
     runtime: python
     plan: starter
     buildCommand: python --version
-    startCommand: python scripts/post_render_daily_report_email.py
-    schedule: "0 15 * * *"
+    startCommand: python scripts/post_render_hourly_tasks.py
+    schedule: "5 * * * *"
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.13
       - key: WEBHOOK_SHARED_SECRET
         sync: false
+      - key: REPORT_EMAIL_UTC_HOUR
+        value: "15"

@@ -42,7 +42,10 @@ def test_schedule_metricool_payloads_normalizes_media_and_creates_post():
                     {
                         "publication_date_time": "2026-07-25 09:00:00",
                         "post_content": "Open-box phone. Shop: https://www.ebay.com/itm/1",
-                        "media_01": "https://i.ebayimg.com/product.jpg",
+                        "media_01": (
+                            "https://horizon-ai-agents.onrender.com/media/products/"
+                            "EBAY-1.tiktok.jpg"
+                        ),
                         "facebook": True,
                         "instagram": True,
                         "tiktok": True,
@@ -75,6 +78,12 @@ def test_schedule_metricool_payloads_normalizes_media_and_creates_post():
     ]
     create_request = next(
         request for request in requests if request.url.path == "/api/v2/scheduler/posts"
+    )
+    normalize_request = next(
+        request for request in requests if request.url.path == "/api/actions/normalize/image/url"
+    )
+    assert normalize_request.url.params["url"] == (
+        "https://horizon-ai-agents.onrender.com/media/products/EBAY-1.tiktok.jpg"
     )
     create_body = json.loads(create_request.content)
     assert create_body["publicationDate"] == {

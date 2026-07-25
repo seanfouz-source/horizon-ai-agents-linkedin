@@ -114,11 +114,15 @@ https://YOUR-PUBLIC-URL/media/campaigns/wholesale.mp4
 https://YOUR-PUBLIC-URL/media/campaigns/ebay-retail-store.mp4
 ```
 
-When `promote_all_inventory` is true, the agent schedules one listing every two
-hours from 09:00 through 21:00 Central time, including weekends. The start time
+The production inventory rotation does not require this Zap. Render refreshes
+the active listings through the eBay API, hosts a compatible copy of each eBay
+image when needed, and creates the Metricool planner post directly.
+
+When `promote_all_inventory` is true, the agent schedules one listing every
+hour from 09:00 through 21:00 Central time, including weekends. The start time
 uses `METRICOOL_MORNING_POST_TIME`; the end and interval use
 `METRICOOL_INVENTORY_POST_END_TIME` and
-`METRICOOL_INVENTORY_POST_INTERVAL_HOURS`. If more than seven posts are
+`METRICOOL_INVENTORY_POST_INTERVAL_HOURS`. If more than thirteen posts are
 generated, the schedule continues at 09:00 the next day.
 
 Other social-draft requests still use at most two Metricool posts per calendar

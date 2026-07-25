@@ -6,6 +6,8 @@ from urllib.error import HTTPError
 import pytest
 
 import app.report_email as report_email
+import scripts.post_render_hourly_tasks as hourly_tasks
+import scripts.post_render_inventory_rotation as inventory_rotation
 from app.report_email import send_gmail_message
 from scripts.send_daily_report_email import build_message, build_report_url, split_addresses
 
@@ -22,6 +24,73 @@ def test_build_report_url_adds_optional_date(monkeypatch):
     monkeypatch.setenv("REPORT_DATE", "2026-06-14")
 
     assert build_report_url() == "https://example.com/webhooks/zapier/daily-report?date=2026-06-14"
+
+
+def test_hourly_inventory_rotation_posts_one_item_directly_to_render(monkeypatch):
+    requests = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self):
+            return b'{"scheduled":1}'
+
+    def fake_urlopen(request, timeout):
+        requests.append((request, timeout))
+        return FakeResponse()
+
+    monkeypatch.setattr(inventory_rotation, "urlopen", fake_urlopen)
+    monkeypatch.setenv("INVENTORY_SCHEDULE_ENDPOINT", "https://render.example/schedule-inventory")
+    monkeypatch.setenv("WEBHOOK_SHARED_SECRET", "shared-secret")
+
+    assert inventory_rotation.main() == 0
+
+    request, timeout = requests[0]
+    assert request.full_url == "https://render.example/schedule-inventory"
+    assert request.method == "POST"
+    assert json.loads(request.data) == {"max_products_per_run": 1}
+    assert request.headers["X-horizon-secret"] == "shared-secret"
+    assert timeout == 900
+
+
+def test_hourly_inventory_rotation_fails_job_when_metricool_rejects_image(monkeypatch):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def read(self):
+            return b'{"status":"partial","scheduled":0,"failed":1}'
+
+    monkeypatch.setattr(inventory_rotation, "urlopen", lambda request, timeout: FakeResponse())
+
+    assert inventory_rotation.main() == 1
+
+
+def test_hourly_render_tasks_refill_inventory_and_send_report_at_configured_hour(monkeypatch):
+    calls = []
+    monkeypatch.setattr(hourly_tasks.post_render_inventory_rotation, "main", lambda: calls.append("inventory") or 0)
+    monkeypatch.setattr(hourly_tasks.post_render_daily_report_email, "main", lambda: calls.append("report") or 0)
+    monkeypatch.setattr(hourly_tasks, "_should_send_report", lambda: True)
+
+    assert hourly_tasks.main() == 0
+    assert calls == ["inventory", "report"]
+
+
+def test_hourly_render_tasks_skip_report_outside_configured_hour(monkeypatch):
+    calls = []
+    monkeypatch.setattr(hourly_tasks.post_render_inventory_rotation, "main", lambda: calls.append("inventory") or 0)
+    monkeypatch.setattr(hourly_tasks.post_render_daily_report_email, "main", lambda: calls.append("report") or 0)
+    monkeypatch.setattr(hourly_tasks, "_should_send_report", lambda: False)
+
+    assert hourly_tasks.main() == 0
+    assert calls == ["inventory"]
 
 
 def test_build_message_attaches_pdf(monkeypatch):
