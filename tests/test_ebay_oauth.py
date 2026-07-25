@@ -27,6 +27,8 @@ def test_ebay_oauth_start_redirects_with_production_keyset(monkeypatch):
     assert query["scope"] == [
         "https://api.ebay.com/oauth/api_scope https://api.ebay.com/oauth/api_scope/sell.inventory"
     ]
+    assert "%20" in response.headers["location"]
+    assert "+" not in response.headers["location"]
     assert main_module._verify_ebay_oauth_state(query["state"][0]) is True
 
 

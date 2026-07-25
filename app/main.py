@@ -10,7 +10,7 @@ from datetime import date, datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, Response
@@ -256,7 +256,8 @@ def ebay_oauth_start() -> RedirectResponse:
             "response_type": "code",
             "scope": settings.ebay_oauth_scopes,
             "state": _sign_ebay_oauth_state(),
-        }
+        },
+        quote_via=quote,
     )
     return RedirectResponse(authorization_url, status_code=302)
 
