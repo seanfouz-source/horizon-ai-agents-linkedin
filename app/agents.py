@@ -1472,8 +1472,6 @@ def _rotate_inventory_items(
         for item in active_items
         if (_item_ebay_item_id(item) not in recent_item_ids)
     ]
-    if not eligible_items:
-        eligible_items = active_items
 
     return sorted(
         eligible_items,

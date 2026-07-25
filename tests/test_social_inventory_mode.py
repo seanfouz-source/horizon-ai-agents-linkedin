@@ -584,6 +584,34 @@ def test_all_inventory_mode_records_history_without_same_day_duplicates(tmp_path
     assert second_batch.metricool_payloads == []
 
 
+def test_inventory_rotation_does_not_requeue_items_inside_cooldown(tmp_path):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    item = InventoryItem(
+        sku="EBAY-1",
+        ebay_item_id="1",
+        title="Apple iPhone 14 Pro Max",
+        condition="Open box",
+        price=565,
+        quantity=1,
+        ebay_url="https://www.ebay.com/itm/1",
+        image_url="https://example.com/iphone.jpg",
+        listing_status="ACTIVE",
+    )
+    repository.upsert_items([item])
+    repository.record_social_post(
+        ebay_item_id="1",
+        sku="EBAY-1",
+        title=item.title,
+        item_url=item.ebay_url,
+        image_url=item.image_url,
+        caption="Shop now",
+        scheduled_at="2099-07-25 09:00:00",
+        platform="facebook,instagram,tiktok,linkedin",
+    )
+
+    assert agents_module._rotate_inventory_items(repository, [item], 1) == []
+
+
 def test_all_inventory_mode_rotates_through_full_store_inventory(tmp_path, monkeypatch):
     repository = InventoryRepository(tmp_path / "inventory.db")
     base_updated_at = datetime.fromisoformat("2026-07-01T12:00:00+00:00")
