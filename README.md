@@ -61,6 +61,7 @@ This is a starter agent hub for promoting an eBay store and answering product qu
 - `POST /webhooks/zapier/social-drafts` creates Facebook, Instagram, and TikTok post drafts.
 - `POST /webhooks/zapier/slow-mover-outreach` creates engagement-first posts for stale eBay items.
 - `POST /webhooks/metricool/inbox` answers Metricool inbox/comment events routed through Zapier.
+- `POST /webhooks/metricool/schedule-inventory` refreshes active eBay inventory and directly fills Metricool's planner with the every-two-hours rotation. The existing Render daily job calls it automatically.
 - `GET /reports/daily` returns a daily Metricool effectiveness report.
 - `GET /reports/daily.md` returns the same report as email-ready Markdown.
 - `GET /reports/daily.pdf` returns a polished PDF attachment.

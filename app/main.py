@@ -34,6 +34,7 @@ from app.integrations import extract_customer_message, manychat_dynamic_response
 from app.inventory import InventoryRepository
 from app.inventory_seed import seed_inventory_if_empty
 from app.media import product_card_for_item, product_card_jpeg_for_item, tiktok_ebay_photo_jpeg_for_item
+from app.metricool import MetricoolPublishError, schedule_metricool_payloads
 from app.models import (
     CustomerQuestion,
     CustomerAnswer,
@@ -1513,6 +1514,53 @@ async def social_drafts(request: SocialDraftRequest) -> dict[str, Any]:
     return response
 
 
+@app.post("/webhooks/metricool/schedule-inventory")
+async def schedule_inventory_rotation(
+    request: Request,
+    x_horizon_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_secret(x_horizon_secret, request.query_params.get("secret"))
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    draft_request = SocialDraftRequest(
+        promote_all_inventory=True,
+        query="all inventory",
+        max_products_per_run=min(max(int(body.get("max_products_per_run", 200)), 1), 200),
+        platforms=["facebook", "instagram", "tiktok", "linkedin"],
+        cross_post_to_all_platforms=True,
+        brand_name=settings.metricool_brand_label,
+        store_url=settings.ebay_store_url,
+        sale_media_url=settings.ebay_store_sale_media_url,
+        publish_after=str(body.get("publish_after") or "").strip() or None,
+        as_draft=False,
+        auto_publish=True,
+    )
+    batch, inventory_refresh = await _create_social_drafts_with_inventory_refresh(draft_request)
+    try:
+        results = await schedule_metricool_payloads(batch.metricool_payloads, settings=settings)
+    except MetricoolPublishError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    _update_metricool_history(batch.metricool_payloads, results)
+    scheduled = sum(1 for result in results if result.get("status") == "scheduled")
+    failed = sum(1 for result in results if result.get("status") == "failed")
+    return {
+        "status": "ok" if not failed else "partial",
+        "campaign_name": batch.campaign_name,
+        "generated": len(batch.metricool_payloads),
+        "scheduled": scheduled,
+        "failed": failed,
+        "inventory_refresh": inventory_refresh,
+        "results": results,
+        "notes": batch.notes,
+    }
+
+
 @app.post("/agent/slow-mover-outreach", response_model=dict[str, Any])
 async def slow_mover_outreach(request: SlowMoverOutreachRequest) -> dict[str, Any]:
     inventory_refresh = await _refresh_inventory_for_social_posts()
@@ -2299,6 +2347,36 @@ async def _create_social_drafts_with_inventory_refresh(
     batch = await create_social_drafts(request)
     _append_inventory_refresh_note(batch, inventory_refresh)
     return batch, inventory_refresh
+
+
+def _update_metricool_history(
+    payloads: list[dict[str, object]],
+    results: list[dict[str, object]],
+) -> None:
+    for payload, result in zip(payloads, results, strict=False):
+        scheduled_at = str(payload.get("publication_date_time") or payload.get("publicationDate") or "")
+        if not scheduled_at:
+            continue
+        sku = str(payload.get("product_sku") or "") or None
+        item = repository.get(sku) if sku else None
+        platforms = ",".join(
+            network
+            for network in ("facebook", "instagram", "tiktok", "linkedin")
+            if payload.get(network)
+        ) or "unknown"
+        repository.record_social_post(
+            ebay_item_id=item.ebay_item_id if item else None,
+            sku=sku,
+            title=str(payload.get("product_title") or "Horizon Wireless eBay listing"),
+            item_url=str(payload.get("ebay_url") or "") or None,
+            image_url=str(payload.get("media_01") or "") or None,
+            caption=str(payload.get("post_content") or ""),
+            scheduled_at=scheduled_at,
+            platform=platforms,
+            metricool_post_id=str(result.get("metricool_post_id") or "") or None,
+            status=str(result.get("status") or "failed"),
+            error_message=str(result.get("error") or "") or None,
+        )
 
 
 async def _refresh_inventory_for_social_posts() -> dict[str, Any]:
