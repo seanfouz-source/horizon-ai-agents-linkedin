@@ -84,6 +84,7 @@ from app.walmart_public_data import PUBLIC_CATALOG_IDENTIFIERS
 
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 GMAIL_OAUTH_STATE_MAX_AGE_SECONDS = 15 * 60
+EBAY_OAUTH_STATE_MAX_AGE_SECONDS = 15 * 60
 settings = get_settings()
 repository = InventoryRepository(settings.resolved_database_path)
 store_syncer = StorePageSyncer(settings, repository)
@@ -243,6 +244,50 @@ def gmail_oauth_status(
             status["refresh_test"] = {"status": "ok"}
 
     return status
+
+
+@app.get("/ebay/oauth/start")
+def ebay_oauth_start() -> RedirectResponse:
+    client_id, _, redirect_name = _ebay_oauth_credentials()
+    authorization_url = "https://auth.ebay.com/oauth2/authorize?" + urlencode(
+        {
+            "client_id": client_id,
+            "redirect_uri": redirect_name,
+            "response_type": "code",
+            "scope": settings.ebay_oauth_scopes,
+            "state": _sign_ebay_oauth_state(),
+        }
+    )
+    return RedirectResponse(authorization_url, status_code=302)
+
+
+@app.get("/ebay/oauth/callback", response_class=HTMLResponse)
+def ebay_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+) -> HTMLResponse:
+    if error:
+        detail = error_description or error
+        raise HTTPException(status_code=400, detail=f"eBay authorization failed: {detail}")
+    if not code:
+        raise HTTPException(status_code=400, detail="eBay authorization did not return a code.")
+    if not state or not _verify_ebay_oauth_state(state):
+        raise HTTPException(status_code=400, detail="Invalid or expired eBay OAuth state.")
+
+    token_payload = _exchange_ebay_authorization_code(code)
+    refresh_token = token_payload.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        raise HTTPException(
+            status_code=503,
+            detail="eBay did not return a refresh token. Restart the eBay OAuth flow and grant access again.",
+        )
+
+    return HTMLResponse(
+        _ebay_oauth_success_html(refresh_token),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/oauth2callback", response_class=HTMLResponse)
@@ -2488,6 +2533,82 @@ def _gmail_oauth_redirect_uri() -> str:
     return f"{settings.public_base_url.rstrip('/')}/oauth2callback"
 
 
+def _ebay_oauth_credentials() -> tuple[str, str, str]:
+    client_id = str(settings.ebay_client_id or "").strip()
+    client_secret = str(settings.ebay_client_secret or "").strip()
+    redirect_name = str(settings.ebay_oauth_redirect_name or "").strip()
+    if not client_id or not client_secret or not redirect_name:
+        raise HTTPException(
+            status_code=503,
+            detail="EBAY_CLIENT_ID, EBAY_CLIENT_SECRET, and EBAY_OAUTH_REDIRECT_NAME are required.",
+        )
+    return client_id, client_secret, redirect_name
+
+
+def _exchange_ebay_authorization_code(code: str) -> dict[str, Any]:
+    client_id, client_secret, redirect_name = _ebay_oauth_credentials()
+    credentials = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+    try:
+        response = httpx.post(
+            "https://api.ebay.com/identity/v1/oauth2/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_name,
+            },
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"eBay OAuth code exchange failed with status {exc.response.status_code}.",
+        ) from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail=f"eBay OAuth code exchange failed: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=503, detail="eBay OAuth code exchange returned an invalid response.")
+    return payload
+
+
+def _sign_ebay_oauth_state() -> str:
+    payload = {
+        "ts": int(time.time()),
+        "nonce": secrets.token_urlsafe(18),
+    }
+    encoded_payload = _urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signature = _ebay_oauth_state_signature(encoded_payload)
+    return f"{encoded_payload}.{signature}"
+
+
+def _verify_ebay_oauth_state(value: str) -> bool:
+    try:
+        encoded_payload, signature = value.rsplit(".", 1)
+    except ValueError:
+        return False
+    expected_signature = _ebay_oauth_state_signature(encoded_payload)
+    if not hmac.compare_digest(signature, expected_signature):
+        return False
+    try:
+        payload = json.loads(_urlsafe_b64decode(encoded_payload).decode("utf-8"))
+        issued_at = int(payload["ts"])
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return False
+    return 0 <= time.time() - issued_at <= EBAY_OAUTH_STATE_MAX_AGE_SECONDS
+
+
+def _ebay_oauth_state_signature(encoded_payload: str) -> str:
+    _, client_secret, _ = _ebay_oauth_credentials()
+    digest = hmac.new(client_secret.encode("utf-8"), encoded_payload.encode("utf-8"), hashlib.sha256).digest()
+    return _urlsafe_b64encode(digest)
+
+
 def _sign_gmail_oauth_state() -> str:
     payload = {
         "ts": int(time.time()),
@@ -2571,6 +2692,24 @@ def _gmail_oauth_success_html(refresh_token: str) -> str:
   <p>Copy this value into Render for the <code>horizon-ai-agents</code> web service.</p>
   <pre>GMAIL_REFRESH_TOKEN_CURRENT={escaped_token}</pre>
   <p>After saving the environment variable, trigger the daily report cron again.</p>
+</body>
+</html>"""
+
+
+def _ebay_oauth_success_html(refresh_token: str) -> str:
+    escaped_token = escape(refresh_token)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="robots" content="noindex">
+  <title>eBay connected</title>
+</head>
+<body>
+  <h1>eBay connected</h1>
+  <p>Copy this value into Render for the <code>horizon-ai-agents</code> web service.</p>
+  <pre>EBAY_REFRESH_TOKEN={escaped_token}</pre>
+  <p>This page is not cached. Close it after saving the environment variable.</p>
 </body>
 </html>"""
 

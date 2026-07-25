@@ -39,6 +39,7 @@ class Settings(BaseSettings):
         "https://api.ebay.com/oauth/api_scope "
         "https://api.ebay.com/oauth/api_scope/sell.inventory"
     )
+    ebay_oauth_redirect_name: str = "Exactspec_Elect-Exactspe-Horizo-brpyrin"
     ebay_application_oauth_scopes: str = "https://api.ebay.com/oauth/api_scope"
     ebay_catalog_oauth_scopes: str = "https://api.ebay.com/oauth/api_scope/sell.inventory"
     ebay_marketplace_id: str = "EBAY_US"
