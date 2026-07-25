@@ -34,15 +34,15 @@ class FakeRepository:
         return next((item for item in self.items if item.sku == sku), None)
 
 
-def inventory_half_hour_slots(count, start_at=None):
+def inventory_two_hour_slots(count, start_at=None):
     base = datetime.fromisoformat(start_at or "2026-07-02 09:00:00")
     return [
-        (base + timedelta(minutes=30 * index)).strftime("%Y-%m-%d %H:%M:%S")
+        (base + timedelta(hours=2 * index)).strftime("%Y-%m-%d %H:%M:%S")
         for index in range(count)
     ]
 
 
-def test_inventory_publication_times_schedule_two_per_hour_until_items_run_out():
+def test_inventory_publication_times_schedule_every_two_hours_during_daytime():
     central = ZoneInfo("America/Chicago")
 
     publication_times = agents_module._inventory_metricool_publication_times(
@@ -53,15 +53,34 @@ def test_inventory_publication_times_schedule_two_per_hour_until_items_run_out()
     assert len(publication_times) == 19
     assert publication_times[:4] == [
         "2026-07-02 09:00:00",
-        "2026-07-02 09:30:00",
-        "2026-07-02 10:00:00",
-        "2026-07-02 10:30:00",
+        "2026-07-02 11:00:00",
+        "2026-07-02 13:00:00",
+        "2026-07-02 15:00:00",
     ]
-    assert publication_times[-1] == "2026-07-02 18:00:00"
-    counts_by_hour = {}
-    for publication_time in publication_times:
-        counts_by_hour[publication_time[:13]] = counts_by_hour.get(publication_time[:13], 0) + 1
-    assert max(counts_by_hour.values()) == 2
+    assert publication_times[6:9] == [
+        "2026-07-02 21:00:00",
+        "2026-07-03 09:00:00",
+        "2026-07-03 11:00:00",
+    ]
+    assert publication_times[-1] == "2026-07-04 17:00:00"
+    assert all(
+        value[11:16] in {"09:00", "11:00", "13:00", "15:00", "17:00", "19:00", "21:00"}
+        for value in publication_times
+    )
+
+
+def test_inventory_publication_times_roll_to_next_morning_after_last_slot():
+    central = ZoneInfo("America/Chicago")
+
+    publication_times = agents_module._inventory_metricool_publication_times(
+        2,
+        now=datetime(2026, 7, 2, 20, 45, tzinfo=central),
+    )
+
+    assert publication_times == [
+        "2026-07-03 09:00:00",
+        "2026-07-03 11:00:00",
+    ]
 
 
 def test_all_inventory_mode_creates_one_payload_per_item_cross_posted(monkeypatch):
@@ -535,7 +554,7 @@ def test_all_inventory_mode_records_history_without_same_day_duplicates(tmp_path
     monkeypatch.setattr(
         agents_module,
         "_inventory_metricool_publication_times",
-        inventory_half_hour_slots,
+        inventory_two_hour_slots,
     )
 
     request = SocialDraftRequest(
@@ -551,12 +570,13 @@ def test_all_inventory_mode_records_history_without_same_day_duplicates(tmp_path
 
     assert [payload["publication_date_time"] for payload in first_batch.metricool_payloads] == [
         "2026-07-02 09:00:00",
-        "2026-07-02 09:30:00",
-        "2026-07-02 10:00:00",
+        "2026-07-02 11:00:00",
+        "2026-07-02 13:00:00",
     ]
     assert repository.social_post_count_for_day("2026-07-02") == 3
-    assert repository.social_post_count_for_hour("2026-07-02 09") == 2
-    assert repository.social_post_count_for_hour("2026-07-02 10") == 1
+    assert repository.social_post_count_for_hour("2026-07-02 09") == 1
+    assert repository.social_post_count_for_hour("2026-07-02 11") == 1
+    assert repository.social_post_count_for_hour("2026-07-02 13") == 1
 
     second_batch = asyncio.run(agents_module.create_social_drafts(request))
 
@@ -648,7 +668,7 @@ def test_all_inventory_mode_matches_composite_ebay_ids_to_history(tmp_path, monk
             item_url=f"https://www.ebay.com/itm/36600000000{index}",
             image_url=f"https://i.ebayimg.com/images/g/{index}/s-l1600.jpg",
             caption="Queued earlier",
-            scheduled_at=f"2026-07-02 09:{(index - 1) * 30:02d}:00",
+            scheduled_at=f"2026-07-02 {9 + ((index - 1) * 2):02d}:00:00",
             platform="facebook,instagram,tiktok,linkedin",
         )
 
@@ -656,7 +676,7 @@ def test_all_inventory_mode_matches_composite_ebay_ids_to_history(tmp_path, monk
     monkeypatch.setattr(
         agents_module,
         "_inventory_metricool_publication_times",
-        inventory_half_hour_slots,
+        inventory_two_hour_slots,
     )
 
     batch = asyncio.run(
@@ -683,7 +703,7 @@ def test_inventory_scheduler_skips_items_already_scheduled_that_day(tmp_path):
             item_url=f"https://www.ebay.com/itm/36600000000{index}",
             image_url=f"https://i.ebayimg.com/images/g/{index}/s-l1600.jpg",
             caption="Queued earlier",
-            scheduled_at=f"2026-07-02 09:{(index - 1) * 30:02d}:00",
+            scheduled_at=f"2026-07-02 {9 + ((index - 1) * 2):02d}:00:00",
             platform="facebook,instagram,tiktok,linkedin",
         )
     posts = [
@@ -701,7 +721,7 @@ def test_inventory_scheduler_skips_items_already_scheduled_that_day(tmp_path):
     scheduled_posts = agents_module._assign_inventory_posts_to_daily_unique_slots(
         repository,
         posts,
-        ["2026-07-02 10:00:00", "2026-07-02 10:30:00"],
+        ["2026-07-02 13:00:00", "2026-07-02 15:00:00"],
         2,
     )
 
@@ -710,8 +730,8 @@ def test_inventory_scheduler_skips_items_already_scheduled_that_day(tmp_path):
         "EBAY-366000000004",
     ]
     assert [post.suggested_schedule for post in scheduled_posts] == [
-        "2026-07-02 10:00:00",
-        "2026-07-02 10:30:00",
+        "2026-07-02 13:00:00",
+        "2026-07-02 15:00:00",
     ]
 
 
@@ -754,7 +774,7 @@ def test_all_inventory_mode_respects_existing_hourly_history(tmp_path, monkeypat
     monkeypatch.setattr(
         agents_module,
         "_inventory_metricool_publication_times",
-        inventory_half_hour_slots,
+        inventory_two_hour_slots,
     )
 
     batch = asyncio.run(
@@ -768,4 +788,4 @@ def test_all_inventory_mode_respects_existing_hourly_history(tmp_path, monkeypat
         )
     )
 
-    assert [payload["publication_date_time"] for payload in batch.metricool_payloads] == ["2026-07-02 10:00:00"]
+    assert [payload["publication_date_time"] for payload in batch.metricool_payloads] == ["2026-07-02 11:00:00"]

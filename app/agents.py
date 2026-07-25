@@ -40,9 +40,10 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 INVENTORY_ROTATION_CANDIDATE_LIMIT = 200
-INVENTORY_POSTS_PER_HOUR = 2
-INVENTORY_POSTING_INTERVAL = timedelta(minutes=30)
+INVENTORY_POSTS_PER_HOUR = 1
+INVENTORY_POSTING_INTERVAL = timedelta(hours=2)
 INVENTORY_DEFAULT_START_TIME = time(9, 0)
+INVENTORY_DEFAULT_END_TIME = time(21, 0)
 
 
 def get_repository() -> InventoryRepository:
@@ -1061,7 +1062,7 @@ async def _create_all_inventory_social_drafts(request: SocialDraftRequest) -> So
         notes=(
             f"Generated {len(posts)} scheduled Summer Sale post payloads from {len(items)} in-stock inventory items. "
             "Use the metricool_*_items fields or loop over metricool_payloads in Zapier to schedule every item "
-            "at the two-listings-per-hour Metricool cadence until the active inventory runs out."
+            "at the every-two-hours daytime Metricool cadence until the active inventory runs out."
         ),
     )
     batch.metricool_payloads = [metricool_payload(post, request) for post in batch.posts]
@@ -1171,8 +1172,10 @@ def _available_metricool_publication_times(
         return []
 
     hourly_limit = _metricool_hourly_post_limit()
+    daily_limit = _metricool_daily_post_limit()
     publication_times: list[str] = []
     hourly_counts: dict[str, int] = {}
+    selected_daily_counts: dict[str, int] = {}
     probe_start = start_at
 
     for _ in range(370):
@@ -1181,7 +1184,14 @@ def _available_metricool_publication_times(
             break
 
         for candidate in candidates:
+            scheduled_day = candidate[:10]
             scheduled_hour = candidate[:13]
+            existing_daily_count = max(
+                repository.social_post_count_for_day(scheduled_day),
+                int(external_daily_counts.get(scheduled_day, 0)),
+            )
+            if existing_daily_count + selected_daily_counts.get(scheduled_day, 0) >= daily_limit:
+                continue
             if scheduled_hour not in hourly_counts:
                 hourly_counts[scheduled_hour] = repository.social_post_count_for_hour(scheduled_hour)
             if hourly_counts[scheduled_hour] >= hourly_limit:
@@ -1190,11 +1200,12 @@ def _available_metricool_publication_times(
                 continue
             publication_times.append(candidate)
             hourly_counts[scheduled_hour] += 1
+            selected_daily_counts[scheduled_day] = selected_daily_counts.get(scheduled_day, 0) + 1
             if len(publication_times) == count:
                 return publication_times
 
         last_candidate = datetime.strptime(candidates[-1], METRICOOL_PUBLICATION_FORMAT)
-        next_slot = last_candidate + INVENTORY_POSTING_INTERVAL
+        next_slot = last_candidate + _inventory_posting_interval()
         probe_start = next_slot.strftime(METRICOOL_PUBLICATION_FORMAT)
 
     return publication_times
@@ -1218,15 +1229,26 @@ def _inventory_metricool_publication_times(
         minimum_time = schedule_start
 
     posting_start = _inventory_daily_start_time()
-    day_start = datetime.combine(minimum_time.date(), posting_start, tzinfo=POSTING_TIMEZONE)
-    if minimum_time < day_start:
-        minimum_time = day_start
+    posting_end = _inventory_daily_end_time()
+    posting_interval = _inventory_posting_interval()
+    if posting_end < posting_start:
+        posting_end = INVENTORY_DEFAULT_END_TIME
 
-    first_slot = _ceil_to_inventory_posting_slot(minimum_time)
-    return [
-        (first_slot + (INVENTORY_POSTING_INTERVAL * index)).strftime(METRICOOL_PUBLICATION_FORMAT)
-        for index in range(count)
-    ]
+    publication_times: list[str] = []
+    candidate_date = minimum_time.date()
+    for _ in range(370):
+        day_start = datetime.combine(candidate_date, posting_start, tzinfo=POSTING_TIMEZONE)
+        day_end = datetime.combine(candidate_date, posting_end, tzinfo=POSTING_TIMEZONE)
+        candidate = day_start
+        while candidate <= day_end:
+            if candidate >= minimum_time:
+                publication_times.append(candidate.strftime(METRICOOL_PUBLICATION_FORMAT))
+                if len(publication_times) == count:
+                    return publication_times
+            candidate += posting_interval
+        candidate_date += timedelta(days=1)
+
+    return publication_times
 
 
 def _coerce_inventory_schedule_start(value: str | datetime | None) -> datetime | None:
@@ -1243,15 +1265,6 @@ def _coerce_inventory_schedule_start(value: str | datetime | None) -> datetime |
         return None
 
 
-def _ceil_to_inventory_posting_slot(candidate: datetime) -> datetime:
-    rounded = candidate.astimezone(POSTING_TIMEZONE).replace(second=0, microsecond=0)
-    if rounded.minute in {0, 30}:
-        return rounded
-    if rounded.minute < 30:
-        return rounded.replace(minute=30)
-    return rounded.replace(minute=0) + timedelta(hours=1)
-
-
 def _inventory_daily_start_time() -> time:
     settings = get_settings()
     try:
@@ -1259,6 +1272,24 @@ def _inventory_daily_start_time() -> time:
         return time(int(hour), int(minute))
     except (AttributeError, TypeError, ValueError):
         return INVENTORY_DEFAULT_START_TIME
+
+
+def _inventory_daily_end_time() -> time:
+    settings = get_settings()
+    try:
+        hour, minute = settings.metricool_inventory_post_end_time.strip().split(":", maxsplit=1)
+        return time(int(hour), int(minute))
+    except (AttributeError, TypeError, ValueError):
+        return INVENTORY_DEFAULT_END_TIME
+
+
+def _inventory_posting_interval() -> timedelta:
+    settings = get_settings()
+    try:
+        hours = int(settings.metricool_inventory_post_interval_hours)
+    except (AttributeError, TypeError, ValueError):
+        return INVENTORY_POSTING_INTERVAL
+    return timedelta(hours=max(1, min(hours, 12)))
 
 
 def _metricool_hourly_post_limit() -> int:
@@ -1274,8 +1305,11 @@ async def _metricool_existing_counts(
 
 
 def _metricool_daily_post_limit() -> int:
-    settings = get_settings()
-    return max(1, min(int(settings.metricool_daily_post_limit or 2), 2))
+    start = datetime.combine(datetime.today(), _inventory_daily_start_time())
+    end = datetime.combine(datetime.today(), _inventory_daily_end_time())
+    if end < start:
+        return 1
+    return max(1, int((end - start) / _inventory_posting_interval()) + 1)
 
 
 def _record_metricool_payloads(

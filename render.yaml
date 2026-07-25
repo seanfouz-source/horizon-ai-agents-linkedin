@@ -91,6 +91,10 @@ services:
         value: "09:00"
       - key: METRICOOL_EVENING_POST_TIME
         value: "18:00"
+      - key: METRICOOL_INVENTORY_POST_END_TIME
+        value: "21:00"
+      - key: METRICOOL_INVENTORY_POST_INTERVAL_HOURS
+        value: "2"
       - key: METRICOOL_REPOST_COOLDOWN_DAYS
         value: "14"
       - key: WEBHOOK_SHARED_SECRET

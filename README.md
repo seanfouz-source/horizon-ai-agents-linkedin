@@ -157,9 +157,12 @@ eligible active eBay listing, using an Instagram-safe square version of the eBay
 store's July Summer Sale banner as the default campaign media. If `sale_media_url` and `media_url` are omitted, the
 app falls back to the selected eBay product image when available. Metricool remains the public social scheduler; the app only prepares
 Metricool-ready payloads and records local scheduling history to prevent reruns
-from duplicating posts. The hard default cap is 2 Metricool posts per calendar
-day total, using `METRICOOL_MORNING_POST_TIME` and
-`METRICOOL_EVENING_POST_TIME`. Items are not reposted within
+from duplicating posts. All-inventory campaigns rotate one listing every two
+hours from 09:00 through 21:00 Central time, including weekends. The start time
+uses `METRICOOL_MORNING_POST_TIME`; the end and interval use
+`METRICOOL_INVENTORY_POST_END_TIME` and
+`METRICOOL_INVENTORY_POST_INTERVAL_HOURS`. Other social campaigns keep the
+two-per-day morning/evening defaults. Items are not reposted within
 `METRICOOL_REPOST_COOLDOWN_DAYS` by default. Summer Sale product captions include
 the eBay store page plus a visible `View this listing:` eBay item link, and the
 Zapier response also includes

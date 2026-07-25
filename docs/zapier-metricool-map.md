@@ -114,11 +114,16 @@ https://YOUR-PUBLIC-URL/media/campaigns/wholesale.mp4
 https://YOUR-PUBLIC-URL/media/campaigns/ebay-retail-store.mp4
 ```
 
-When `publish_after` is omitted, the agent schedules at most two Metricool posts
-per calendar day in Central time. The default slots are 09:00 and 18:00, and
-they can be changed with `METRICOOL_MORNING_POST_TIME` and
-`METRICOOL_EVENING_POST_TIME`. If more than two posts are generated, the
-schedule continues on the next day.
+When `promote_all_inventory` is true, the agent schedules one listing every two
+hours from 09:00 through 21:00 Central time, including weekends. The start time
+uses `METRICOOL_MORNING_POST_TIME`; the end and interval use
+`METRICOOL_INVENTORY_POST_END_TIME` and
+`METRICOOL_INVENTORY_POST_INTERVAL_HOURS`. If more than seven posts are
+generated, the schedule continues at 09:00 the next day.
+
+Other social-draft requests still use at most two Metricool posts per calendar
+day. Their default slots are 09:00 and 18:00 and can be changed with
+`METRICOOL_MORNING_POST_TIME` and `METRICOOL_EVENING_POST_TIME`.
 
 When `publish_after` is provided, treat it as the earliest start time, not as a
 single publication time for every eBay listing. The app still spreads the
