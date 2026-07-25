@@ -76,7 +76,7 @@ class Settings(BaseSettings):
     metricool_evening_post_time: str = "18:00"
     metricool_inventory_post_end_time: str = "21:00"
     metricool_inventory_post_interval_hours: int = 1
-    metricool_repost_cooldown_days: int = 14
+    metricool_repost_cooldown_days: int = 6
     report_email_to: str = "sean.fouz@gmail.com,horizonwirelesstx@gmail.com"
     report_email_provider: str = "smtp"
     report_email_from: str | None = None
