@@ -1575,9 +1575,11 @@ async def schedule_inventory_rotation(
 
     draft_request = SocialDraftRequest(
         promote_all_inventory=True,
-        ignore_recent_history=bool(body.get("ignore_recent_history", False)),
+        # This webhook is called once per hour by Render. Keep the rotation
+        # idempotent even if a caller supplies stale bulk/backfill options.
+        ignore_recent_history=False,
         query="all inventory",
-        max_products_per_run=min(max(int(body.get("max_products_per_run", 200)), 1), 200),
+        max_products_per_run=1,
         platforms=["facebook", "instagram", "tiktok", "linkedin"],
         cross_post_to_all_platforms=True,
         brand_name=settings.metricool_brand_label,

@@ -1,6 +1,7 @@
 import asyncio
 
 import app.main as main_module
+from fastapi.testclient import TestClient
 from app.models import SocialDraftBatch, SocialDraftRequest
 
 
@@ -107,6 +108,46 @@ def test_promote_all_inventory_requires_fresh_ebay_api_sync(monkeypatch):
     assert batch.posts == []
     assert batch.metricool_payloads == []
     assert "latest eBay API inventory was not confirmed" in batch.notes
+
+
+def test_inventory_schedule_webhook_forces_one_history_aware_listing(monkeypatch):
+    captured_requests = []
+    inventory_refresh = {
+        "source": "pre-social-refresh",
+        "status": "ok",
+        "message": "Inventory refreshed.",
+        "ebay_sync": {"status": "ok", "imported": 75},
+        "store_sync": {"status": "not_run", "imported": 0},
+    }
+
+    async def fake_create_social_drafts_with_inventory_refresh(request):
+        captured_requests.append(request)
+        return (
+            SocialDraftBatch(campaign_name="Daily all-inventory promotion", posts=[], notes="No eligible items."),
+            inventory_refresh,
+        )
+
+    async def fake_schedule_metricool_payloads(payloads, settings):
+        assert payloads == []
+        return []
+
+    monkeypatch.setattr(main_module.settings, "webhook_shared_secret", None)
+    monkeypatch.setattr(
+        main_module,
+        "_create_social_drafts_with_inventory_refresh",
+        fake_create_social_drafts_with_inventory_refresh,
+    )
+    monkeypatch.setattr(main_module, "schedule_metricool_payloads", fake_schedule_metricool_payloads)
+
+    response = TestClient(main_module.app).post(
+        "/webhooks/metricool/schedule-inventory",
+        json={"max_products_per_run": 75, "ignore_recent_history": True},
+    )
+
+    assert response.status_code == 200
+    assert len(captured_requests) == 1
+    assert captured_requests[0].max_products_per_run == 1
+    assert captured_requests[0].ignore_recent_history is False
 
 
 def test_social_drafts_falls_back_to_store_page_when_ebay_api_fails(monkeypatch):
