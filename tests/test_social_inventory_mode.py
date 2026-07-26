@@ -13,10 +13,10 @@ from app.models import InventoryItem, SocialDraftRequest, SocialPost
 
 @pytest.fixture(autouse=True)
 def disable_live_metricool_lookup(monkeypatch):
-    async def fake_scheduled_counts(*args, **kwargs):
-        return {}
+    async def fake_scheduled_inventory_state(*args, **kwargs):
+        return {}, set(), set()
 
-    monkeypatch.setattr(agents_module, "scheduled_post_counts_by_day", fake_scheduled_counts)
+    monkeypatch.setattr(agents_module, "scheduled_inventory_state", fake_scheduled_inventory_state)
 
 
 class FakeRepository:
@@ -584,7 +584,7 @@ def test_all_inventory_mode_records_history_without_same_day_duplicates(tmp_path
     assert second_batch.metricool_payloads == []
 
 
-def test_inventory_rotation_does_not_requeue_items_inside_cooldown(tmp_path):
+def test_inventory_rotation_does_not_requeue_items_scheduled_in_metricool(tmp_path):
     repository = InventoryRepository(tmp_path / "inventory.db")
     item = InventoryItem(
         sku="EBAY-1",
@@ -609,7 +609,40 @@ def test_inventory_rotation_does_not_requeue_items_inside_cooldown(tmp_path):
         platform="facebook,instagram,tiktok,linkedin",
     )
 
-    assert agents_module._rotate_inventory_items(repository, [item], 1) == []
+    assert agents_module._rotate_inventory_items(
+        repository,
+        [item],
+        1,
+        excluded_item_ids={"1"},
+    ) == []
+
+
+def test_inventory_rotation_ignores_stale_future_history_rows(tmp_path):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    item = InventoryItem(
+        sku="EBAY-1",
+        ebay_item_id="1",
+        title="Apple iPhone 14 Pro Max",
+        condition="Open box",
+        price=565,
+        quantity=1,
+        ebay_url="https://www.ebay.com/itm/1",
+        image_url="https://example.com/iphone.jpg",
+        listing_status="ACTIVE",
+    )
+    repository.upsert_items([item])
+    repository.record_social_post(
+        ebay_item_id="1",
+        sku="EBAY-1",
+        title=item.title,
+        item_url=item.ebay_url,
+        image_url=item.image_url,
+        caption="Deleted from Metricool",
+        scheduled_at="2099-07-25 09:00:00",
+        platform="facebook,instagram,tiktok,linkedin",
+    )
+
+    assert agents_module._rotate_inventory_items(repository, [item], 1) == [item]
 
 
 def test_all_inventory_mode_rotates_through_full_store_inventory(tmp_path, monkeypatch):

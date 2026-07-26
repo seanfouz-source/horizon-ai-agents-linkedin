@@ -692,6 +692,7 @@ class InventoryRepository:
         if current.tzinfo is None:
             current = current.replace(tzinfo=timezone.utc)
         threshold = (current - timedelta(days=max(0, cooldown_days))).strftime("%Y-%m-%d %H:%M:%S")
+        current_text = current.strftime("%Y-%m-%d %H:%M:%S")
         with self.connect() as connection:
             rows = connection.execute(
                 """
@@ -701,11 +702,11 @@ class InventoryRepository:
                 AND ebay_item_id != ''
                 AND status NOT IN ('failed', 'cancelled', 'skipped')
                 AND (
-                    scheduled_at >= ?
-                    OR posted_at >= ?
+                    (scheduled_at >= ? AND scheduled_at <= ?)
+                    OR (posted_at >= ? AND posted_at <= ?)
                 )
                 """,
-                (threshold, threshold),
+                (threshold, current_text, threshold, current_text),
             ).fetchall()
         return {str(row["ebay_item_id"]) for row in rows}
 

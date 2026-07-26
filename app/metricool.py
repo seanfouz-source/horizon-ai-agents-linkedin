@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 METRICOOL_NETWORKS = ("facebook", "instagram", "tiktok", "linkedin")
 METRICOOL_PUBLISH_CONCURRENCY = 4
 METRICOOL_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+EBAY_ITEM_URL_PATTERN = re.compile(r"ebay\.com/itm/(?:[^/?#]+/)?(\d+)", re.IGNORECASE)
 
 
 class MetricoolPublishError(RuntimeError):
@@ -31,9 +33,23 @@ async def scheduled_post_counts_by_day(
     days: int,
     settings: Settings | None = None,
 ) -> dict[str, int]:
+    counts, _, _ = await scheduled_inventory_state(
+        start_at=start_at,
+        days=days,
+        settings=settings,
+    )
+    return counts
+
+
+async def scheduled_inventory_state(
+    *,
+    start_at: str | None,
+    days: int,
+    settings: Settings | None = None,
+) -> tuple[dict[str, int], set[str], set[str]]:
     resolved_settings = settings or get_settings()
     if not resolved_settings.metricool_api_token:
-        return {}
+        return {}, set(), set()
 
     start_date = _start_date(start_at)
     day_count = max(1, min(days, 60))
@@ -42,14 +58,39 @@ async def scheduled_post_counts_by_day(
         async with httpx.AsyncClient(timeout=30) as client:
             brand = await _resolve_metricool_brand(client, resolved_settings)
             counts: dict[str, int] = {}
+            ebay_item_ids: set[str] = set()
+            scheduled_slots: set[str] = set()
             for offset in range(day_count):
                 report_date = start_date + timedelta(days=offset)
                 posts = await _retrieve_scheduled_posts(client, resolved_settings, brand, report_date)
                 counts[report_date.isoformat()] = len(posts)
-            return counts
+                ebay_item_ids.update(_scheduled_ebay_item_ids_from_posts(posts))
+                scheduled_slots.update(_scheduled_slots_from_posts(posts))
+            return counts, ebay_item_ids, scheduled_slots
     except (httpx.HTTPError, MetricoolReportError, ValueError, KeyError) as exc:
         logger.warning("Could not check existing Metricool scheduled posts: %s", exc)
-        return {}
+        return {}, set(), set()
+
+
+def _scheduled_ebay_item_ids_from_posts(posts: list[dict[str, Any]]) -> set[str]:
+    item_ids: set[str] = set()
+    for post in posts:
+        match = EBAY_ITEM_URL_PATTERN.search(str(post.get("text") or ""))
+        if match:
+            item_ids.add(match.group(1))
+    return item_ids
+
+
+def _scheduled_slots_from_posts(posts: list[dict[str, Any]]) -> set[str]:
+    slots: set[str] = set()
+    for post in posts:
+        publication_date = post.get("publicationDate")
+        if not isinstance(publication_date, dict):
+            continue
+        date_time = publication_date.get("dateTime")
+        if isinstance(date_time, str) and date_time.strip():
+            slots.add(date_time.strip().replace("T", " "))
+    return slots
 
 
 async def schedule_metricool_payloads(

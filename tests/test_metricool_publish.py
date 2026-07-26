@@ -4,7 +4,31 @@ import json
 import httpx
 
 from app.config import Settings
-from app.metricool import schedule_metricool_payloads
+from app.metricool import (
+    _scheduled_ebay_item_ids_from_posts,
+    _scheduled_slots_from_posts,
+    schedule_metricool_payloads,
+)
+
+
+def test_scheduled_ebay_item_ids_are_read_from_metricool_post_text():
+    assert _scheduled_ebay_item_ids_from_posts(
+        [
+            {"text": "Shop https://www.ebay.com/itm/366419898687"},
+            {"text": "Shop https://www.ebay.com/itm/item-title/366429621102?foo=bar"},
+            {"text": "No eBay listing here"},
+        ]
+    ) == {"366419898687", "366429621102"}
+
+
+def test_scheduled_slots_are_normalized_for_rotation_checks():
+    assert _scheduled_slots_from_posts(
+        [
+            {"publicationDate": {"dateTime": "2026-07-26T09:00:00"}},
+            {"publicationDate": {"dateTime": "2026-07-26T10:00:00"}},
+            {"publicationDate": None},
+        ]
+    ) == {"2026-07-26 09:00:00", "2026-07-26 10:00:00"}
 
 
 def test_schedule_metricool_payloads_normalizes_media_and_creates_post():

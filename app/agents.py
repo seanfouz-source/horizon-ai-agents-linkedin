@@ -17,7 +17,7 @@ from app.integrations import (
     metricool_payload,
 )
 from app.inventory import InventoryRepository
-from app.metricool import scheduled_post_counts_by_day
+from app.metricool import scheduled_inventory_state
 from app.models import (
     CustomerAnswer,
     CustomerQuestion,
@@ -1026,7 +1026,17 @@ async def _create_all_inventory_social_drafts(request: SocialDraftRequest) -> So
         INVENTORY_ROTATION_CANDIDATE_LIMIT,
         max(request.max_products_per_run, request.max_products_per_run * 10),
     )
-    items = _inventory_items_for_daily_promotion(repository, request, limit=candidate_limit)
+    lookahead_days = max(7, (candidate_limit // _metricool_daily_post_limit()) + 3)
+    metricool_counts, externally_scheduled_item_ids, externally_scheduled_slots = await scheduled_inventory_state(
+        start_at=request.publish_after,
+        days=lookahead_days,
+    )
+    items = _inventory_items_for_daily_promotion(
+        repository,
+        request,
+        limit=candidate_limit,
+        excluded_item_ids=externally_scheduled_item_ids,
+    )
     if not items:
         return SocialDraftBatch(
             campaign_name="Daily all-inventory promotion",
@@ -1046,12 +1056,12 @@ async def _create_all_inventory_social_drafts(request: SocialDraftRequest) -> So
             for platform in request.platforms:
                 posts.append(_inventory_social_post(item, request, platform=platform))
 
-    metricool_counts = await _metricool_existing_counts(len(posts), request)
     posts = _schedule_metricool_posts(
         repository,
         posts,
         request,
         metricool_counts,
+        external_scheduled_slots=externally_scheduled_slots,
         max_posts=request.max_products_per_run,
         avoid_duplicate_items_per_day=True,
     )
@@ -1076,6 +1086,7 @@ def _schedule_metricool_posts(
     posts: list[SocialPost],
     request: SocialDraftRequest,
     external_daily_counts: dict[str, int] | None = None,
+    external_scheduled_slots: set[str] | None = None,
     max_posts: int | None = None,
     avoid_duplicate_items_per_day: bool = False,
 ) -> list[SocialPost]:
@@ -1096,6 +1107,7 @@ def _schedule_metricool_posts(
         len(posts),
         request.publish_after,
         external_daily_counts or {},
+        external_scheduled_slots or set(),
     )
     if avoid_duplicate_items_per_day:
         return _assign_inventory_posts_to_daily_unique_slots(
@@ -1103,6 +1115,7 @@ def _schedule_metricool_posts(
             posts,
             schedule,
             target_count,
+            use_repository_history=not bool(external_daily_counts),
         )
 
     scheduled_posts = posts[: min(len(schedule), target_count)]
@@ -1116,6 +1129,8 @@ def _assign_inventory_posts_to_daily_unique_slots(
     posts: list[SocialPost],
     schedule: list[str],
     target_count: int,
+    *,
+    use_repository_history: bool = True,
 ) -> list[SocialPost]:
     scheduled_posts: list[SocialPost] = []
     unscheduled_posts = posts.copy()
@@ -1124,7 +1139,11 @@ def _assign_inventory_posts_to_daily_unique_slots(
     for publication_time in schedule:
         scheduled_day = publication_time[:10]
         if scheduled_day not in used_ids_by_day:
-            used_ids_by_day[scheduled_day] = _promoted_ebay_item_ids_for_day(repository, scheduled_day)
+            used_ids_by_day[scheduled_day] = (
+                _promoted_ebay_item_ids_for_day(repository, scheduled_day)
+                if use_repository_history
+                else set()
+            )
         used_ids = used_ids_by_day[scheduled_day]
 
         post_index = _first_post_not_used_on_day(unscheduled_posts, used_ids)
@@ -1167,6 +1186,7 @@ def _available_metricool_publication_times(
     count: int,
     start_at: str | None,
     external_daily_counts: dict[str, int],
+    external_scheduled_slots: set[str],
 ) -> list[str]:
     if count <= 0:
         return []
@@ -1186,17 +1206,27 @@ def _available_metricool_publication_times(
         for candidate in candidates:
             scheduled_day = candidate[:10]
             scheduled_hour = candidate[:13]
-            existing_daily_count = max(
-                repository.social_post_count_for_day(scheduled_day),
-                int(external_daily_counts.get(scheduled_day, 0)),
+            external_day_confirmed = scheduled_day in external_daily_counts
+            existing_daily_count = (
+                int(external_daily_counts[scheduled_day])
+                if external_day_confirmed
+                else repository.social_post_count_for_day(scheduled_day)
             )
             if existing_daily_count + selected_daily_counts.get(scheduled_day, 0) >= daily_limit:
                 continue
             if scheduled_hour not in hourly_counts:
-                hourly_counts[scheduled_hour] = repository.social_post_count_for_hour(scheduled_hour)
+                hourly_counts[scheduled_hour] = (
+                    sum(slot[:13] == scheduled_hour for slot in external_scheduled_slots)
+                    if external_day_confirmed
+                    else repository.social_post_count_for_hour(scheduled_hour)
+                )
             if hourly_counts[scheduled_hour] >= hourly_limit:
                 continue
-            if repository.social_post_count_for_slot(candidate) > 0:
+            if (
+                candidate in external_scheduled_slots
+                if external_day_confirmed
+                else repository.social_post_count_for_slot(candidate) > 0
+            ):
                 continue
             publication_times.append(candidate)
             hourly_counts[scheduled_hour] += 1
@@ -1296,14 +1326,6 @@ def _metricool_hourly_post_limit() -> int:
     return INVENTORY_POSTS_PER_HOUR
 
 
-async def _metricool_existing_counts(
-    post_count: int,
-    request: SocialDraftRequest,
-) -> dict[str, int]:
-    lookahead_days = max(7, (post_count // _metricool_daily_post_limit()) + 3)
-    return await scheduled_post_counts_by_day(start_at=request.publish_after, days=lookahead_days)
-
-
 def _metricool_daily_post_limit() -> int:
     start = datetime.combine(datetime.today(), _inventory_daily_start_time())
     end = datetime.combine(datetime.today(), _inventory_daily_end_time())
@@ -1397,6 +1419,7 @@ def _inventory_items_for_daily_promotion(
     repository: InventoryRepository,
     request: SocialDraftRequest,
     limit: int | None = None,
+    excluded_item_ids: set[str] | None = None,
 ) -> list[InventoryItem]:
     candidate_limit = INVENTORY_ROTATION_CANDIDATE_LIMIT
     requested_limit = limit or request.max_products_per_run
@@ -1408,6 +1431,7 @@ def _inventory_items_for_daily_promotion(
             candidates,
             requested_limit,
             ignore_recent_history=request.ignore_recent_history,
+            excluded_item_ids=excluded_item_ids,
         )
     query = request.query.strip().lower() if request.query else ""
     if query in {"all phones", "phones"}:
@@ -1421,6 +1445,7 @@ def _inventory_items_for_daily_promotion(
             candidates,
             requested_limit,
             ignore_recent_history=request.ignore_recent_history,
+            excluded_item_ids=excluded_item_ids,
         )
     if query and query not in {"all", "all inventory", "daily inventory"}:
         candidates = [item for item in repository.search(request.query, limit=candidate_limit) if _is_ebay_listing(item)]
@@ -1429,12 +1454,14 @@ def _inventory_items_for_daily_promotion(
             candidates,
             requested_limit,
             ignore_recent_history=request.ignore_recent_history,
+            excluded_item_ids=excluded_item_ids,
         )
     return _rotate_inventory_items(
         repository,
         [item for item in repository.all_promotable(limit=candidate_limit) if _is_ebay_listing(item)],
         requested_limit,
         ignore_recent_history=request.ignore_recent_history,
+        excluded_item_ids=excluded_item_ids,
     )
 
 
@@ -1444,6 +1471,7 @@ def _rotate_inventory_items(
     limit: int,
     *,
     ignore_recent_history: bool = False,
+    excluded_item_ids: set[str] | None = None,
 ) -> list[InventoryItem]:
     active_items = []
     for item in items:
@@ -1452,13 +1480,26 @@ def _rotate_inventory_items(
             _log_skipped_inventory_post(item, skip_reason)
             continue
         active_items.append(item)
+    externally_scheduled_ids = {
+        canonical_id
+        for value in (excluded_item_ids or set())
+        if (canonical_id := _canonical_ebay_item_id(value))
+    }
+    active_items = [
+        item
+        for item in active_items
+        if _item_ebay_item_id(item) not in externally_scheduled_ids
+    ]
     if ignore_recent_history or not _repository_supports_post_history(repository):
         return active_items[:limit]
 
     settings = get_settings()
     recent_item_ids = {
         canonical_id
-        for value in repository.recently_promoted_ebay_item_ids(settings.metricool_repost_cooldown_days)
+        for value in repository.recently_promoted_ebay_item_ids(
+            settings.metricool_repost_cooldown_days,
+            now=datetime.now(POSTING_TIMEZONE),
+        )
         if (canonical_id := _canonical_ebay_item_id(value))
     }
     last_posted_at = {
