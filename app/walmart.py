@@ -5,6 +5,8 @@ import uuid
 from base64 import b64encode
 from datetime import date
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from html import unescape
+from html.parser import HTMLParser
 from typing import Any, Iterable
 from urllib.parse import quote
 
@@ -129,6 +131,59 @@ class WalmartMarketplaceClient:
             "query": clean_query,
             "total_candidates": len(items),
             "candidates": candidates,
+        }
+
+    async def enrich_catalog_candidate(self, candidate: dict[str, Any]) -> dict[str, Any]:
+        """Add the public product identifier and weight for one Walmart item candidate."""
+        item_id = str(candidate.get("walmart_item_id") or "").strip()
+        if not item_id or not re.fullmatch(r"\d+", item_id):
+            raise WalmartApiError("The Walmart catalog candidate did not include a valid item ID.")
+
+        url = f"https://www.walmart.com/ip/{quote(item_id, safe='')}"
+        response: httpx.Response | None = None
+        last_transport_error: httpx.TransportError | None = None
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            for attempt in range(len(RETRY_DELAYS_SECONDS) + 1):
+                try:
+                    response = await client.get(
+                        url,
+                        headers={
+                            "Accept": "text/html,application/xhtml+xml",
+                            "User-Agent": (
+                                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/140.0.0.0 Safari/537.36"
+                            ),
+                        },
+                    )
+                except httpx.TransportError as exc:
+                    last_transport_error = exc
+                    if attempt >= len(RETRY_DELAYS_SECONDS):
+                        break
+                    await asyncio.sleep(RETRY_DELAYS_SECONDS[attempt])
+                    continue
+                if response.status_code not in RETRY_STATUS_CODES or attempt >= len(RETRY_DELAYS_SECONDS):
+                    break
+                await asyncio.sleep(RETRY_DELAYS_SECONDS[attempt])
+
+        if response is None:
+            message = "The public Walmart product page could not be loaded."
+            if last_transport_error:
+                message = f"{message} {last_transport_error.__class__.__name__}."
+            raise WalmartApiError(message)
+        try:
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise WalmartApiError(
+                f"The public Walmart product page returned HTTP {response.status_code}.",
+                status_code=response.status_code,
+            ) from exc
+
+        enrichment = parse_walmart_product_page(response.text)
+        return {
+            **candidate,
+            **{key: value for key, value in enrichment.items() if value not in (None, "", {}, [])},
+            "public_product_url": str(response.url),
         }
 
     async def submit_offer_match_feed(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -721,11 +776,46 @@ def select_verified_catalog_match(
     item: InventoryItem,
     candidates: Iterable[dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, str]:
+    plausible, reason = plausible_catalog_candidates(item, candidates)
+    if len(plausible) != 1:
+        return None, reason
+
+    candidate = plausible[0]
+    identifiers = candidate.get("identifiers")
+    if not isinstance(identifiers, dict):
+        return None, "The exact catalog candidate does not expose a product identifier."
+    selected_type: str | None = None
+    selected_value: str | None = None
+    for identifier_type in PRODUCT_ID_TYPES:
+        candidate_value = _digits(identifiers.get(identifier_type))
+        if candidate_value and _valid_product_identifier(identifier_type, candidate_value):
+            selected_type = identifier_type
+            selected_value = candidate_value
+            break
+    if not selected_type or not selected_value:
+        return None, "The exact catalog candidate does not expose a valid product identifier."
+    return {
+        "confidence": "exact_brand_model_variant",
+        "product_id_type": selected_type,
+        "product_id": selected_value,
+        "walmart_item_id": candidate.get("walmart_item_id"),
+        "title": str(candidate.get("title") or ""),
+        "brand": candidate.get("brand"),
+        "shipping_weight_lbs": candidate.get("shipping_weight_lbs"),
+        "public_product_url": candidate.get("public_product_url"),
+    }, "Exactly one Walmart catalog candidate passed all verification checks."
+
+
+def plausible_catalog_candidates(
+    item: InventoryItem,
+    candidates: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], str]:
+    """Return only candidates whose brand, model, variant, and carrier match exactly."""
     specifics = {_normalize_key(key): str(value or "").strip() for key, value in item.item_specifics.items()}
     source_brand = specifics.get("brand")
     source_model = specifics.get("model")
     if not source_brand or not source_model:
-        return None, "The eBay listing does not contain both a brand and model."
+        return [], "The eBay listing does not contain both a brand and model."
 
     storage = specifics.get("storage") or specifics.get("storagecapacity")
     size = specifics.get("size") or specifics.get("casesize")
@@ -737,13 +827,26 @@ def select_verified_catalog_match(
     )
     category = _match_text(item.category)
     if ("smartphone" in category or "tablet" in category) and not storage:
-        return None, "Storage is required to verify phone and tablet catalog variants."
+        return [], "Storage is required to verify phone and tablet catalog variants."
     if "smartwatch" in category and not size:
-        return None, "Case size is required to verify smartwatch catalog variants."
+        return [], "Case size is required to verify smartwatch catalog variants."
 
     required_values = [value for value in (storage, size, color) if value]
     source_brand_key = _match_text(source_brand)
     source_model_key = _match_text(source_model)
+    raw_source_network_text = " ".join(
+        str(value or "")
+        for value in (
+            item.title,
+            specifics.get("network"),
+            specifics.get("carrier"),
+            specifics.get("networklocked"),
+            specifics.get("lockstatus"),
+        )
+    )
+    source_network_text = _match_text(raw_source_network_text)
+    phone_category = "smartphone" in category or "cellphone" in category
+    required_carriers = _carrier_keys(raw_source_network_text)
     verified: list[dict[str, Any]] = []
     for candidate in candidates:
         if not isinstance(candidate, dict):
@@ -760,36 +863,121 @@ def select_verified_catalog_match(
             continue
         if any(_match_text(value) not in title_key for value in required_values):
             continue
-
-        identifiers = candidate.get("identifiers")
-        if not isinstance(identifiers, dict):
+        if phone_category and "unlocked" in source_network_text and "unlocked" not in title_key:
             continue
-        selected_type: str | None = None
-        selected_value: str | None = None
-        for identifier_type in PRODUCT_ID_TYPES:
-            candidate_value = _digits(identifiers.get(identifier_type))
-            if candidate_value and _valid_product_identifier(identifier_type, candidate_value):
-                selected_type = identifier_type
-                selected_value = candidate_value
-                break
-        if not selected_type or not selected_value:
+        if phone_category and any(carrier not in _carrier_keys(title) for carrier in required_carriers):
             continue
-        verified.append(
-            {
-                "confidence": "exact_brand_model_variant",
-                "product_id_type": selected_type,
-                "product_id": selected_value,
-                "walmart_item_id": candidate.get("walmart_item_id"),
-                "title": title,
-                "brand": candidate.get("brand"),
-            }
-        )
+        verified.append(candidate)
 
     if len(verified) != 1:
         if verified:
-            return None, f"{len(verified)} catalog candidates passed; exactly one is required."
-        return None, "No catalog candidate passed the exact brand, model, variation, and identifier checks."
-    return verified[0], "Exactly one Walmart catalog candidate passed all verification checks."
+            return verified, f"{len(verified)} catalog candidates passed; exactly one is required."
+        return [], "No catalog candidate passed the exact brand, model, variation, and carrier checks."
+    return verified, "Exactly one Walmart catalog candidate passed the text verification checks."
+
+
+def estimated_shipping_weight_lbs(item: InventoryItem) -> float:
+    """Return a conservative packaged-weight estimate when neither marketplace supplies one."""
+    text = _match_text(f"{item.category or ''} {item.title}")
+    for needles, pounds in (
+        (("laptop", "notebook", "macbook"), 10.0),
+        (("tablet", "ipad"), 4.0),
+        (("speaker", "boombox"), 5.0),
+        (("headphone", "headset"), 2.0),
+        (("smartphone", "cellphone", "iphone", "galaxy"), 2.0),
+        (("smartwatch", "applewatch", "galaxywatch", "earbud", "airpod"), 1.0),
+    ):
+        if any(needle in text for needle in needles):
+            return pounds
+    return 5.0
+
+
+class _ProductSchemaParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._capturing = False
+        self._buffer: list[str] = []
+        self.scripts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "script":
+            return
+        attributes = {str(key).lower(): str(value or "").lower() for key, value in attrs}
+        self._capturing = attributes.get("type") == "application/ld+json"
+        self._buffer = []
+
+    def handle_data(self, data: str) -> None:
+        if self._capturing:
+            self._buffer.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script" and self._capturing:
+            self.scripts.append("".join(self._buffer))
+            self._capturing = False
+            self._buffer = []
+
+
+def parse_walmart_product_page(html_text: str) -> dict[str, Any]:
+    """Extract public Product JSON-LD without retaining Walmart page internals."""
+    parser = _ProductSchemaParser()
+    parser.feed(str(html_text or ""))
+    products: list[dict[str, Any]] = []
+
+    def collect(value: object) -> None:
+        if isinstance(value, list):
+            for entry in value:
+                collect(entry)
+            return
+        if not isinstance(value, dict):
+            return
+        schema_type = value.get("@type")
+        if schema_type == "Product" or (
+            isinstance(schema_type, list) and "Product" in schema_type
+        ):
+            products.append(value)
+        graph = value.get("@graph")
+        if isinstance(graph, list):
+            collect(graph)
+
+    for script in parser.scripts:
+        try:
+            collect(json.loads(script))
+        except (TypeError, ValueError):
+            continue
+
+    product = products[0] if products else {}
+    identifiers: dict[str, str] = {}
+    for key in ("gtin", "gtin8", "gtin12", "gtin13", "gtin14"):
+        value = _digits(product.get(key))
+        identifier_type = {12: "UPC", 13: "EAN", 14: "GTIN"}.get(len(value))
+        if identifier_type and _valid_product_identifier(identifier_type, value):
+            identifiers.setdefault(identifier_type, value)
+
+    brand_value = product.get("brand")
+    if isinstance(brand_value, dict):
+        brand_value = brand_value.get("name")
+    raw_weight = product.get("weight")
+    if isinstance(raw_weight, dict):
+        raw_weight = raw_weight.get("value") or raw_weight.get("name")
+    weight = _parse_weight_lbs(raw_weight)
+    if weight is None:
+        decoded = unescape(str(html_text or "")).replace('\\"', '"')
+        weight_match = re.search(
+            r'"name"\s*:\s*"(?:Assembled product weight|Shipping weight|Product weight)"'
+            r'.{0,240}?"value"\s*:\s*"([^"]+)"',
+            decoded,
+            flags=re.IGNORECASE,
+        )
+        if weight_match:
+            weight = _parse_weight_lbs(weight_match.group(1))
+
+    return {
+        "title": product.get("name"),
+        "brand": brand_value,
+        "model": product.get("model"),
+        "identifiers": identifiers,
+        "shipping_weight_lbs": weight,
+    }
 
 
 def _build_offer_match_item(
@@ -970,6 +1158,20 @@ def _normalize_key(value: object) -> str:
 
 def _match_text(value: object) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+
+
+def _carrier_keys(value: object) -> set[str]:
+    text = str(value or "").lower()
+    patterns = {
+        "att": r"\b(?:at\s*&\s*t|at\s+and\s+t|att)\b",
+        "verizon": r"\bverizon\b",
+        "tmobile": r"\bt[ -]?mobile\b",
+        "tracfone": r"\btracfone\b",
+        "straighttalk": r"\bstraight[ -]?talk\b",
+        "boostmobile": r"\bboost(?:[ -]?mobile)?\b",
+        "cricket": r"\bcricket\b",
+    }
+    return {key for key, pattern in patterns.items() if re.search(pattern, text)}
 
 
 def _catalog_candidate(raw_item: object) -> dict[str, Any] | None:

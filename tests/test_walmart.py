@@ -12,6 +12,8 @@ from app.walmart import (
     build_offer_match_preview,
     build_walmart_catalog_query,
     build_walmart_draft,
+    estimated_shipping_weight_lbs,
+    parse_walmart_product_page,
     select_verified_catalog_match,
 )
 
@@ -244,6 +246,62 @@ def test_verified_catalog_match_rejects_ambiguous_results():
 
     assert match is None
     assert reason.startswith("2 catalog candidates")
+
+
+def test_verified_catalog_match_rejects_locked_carrier_variant_for_unlocked_phone():
+    item = InventoryItem(
+        sku="EBAY-UNLOCKED",
+        title="Samsung Galaxy A16 128GB Unlocked",
+        category="Cell Phones & Accessories:Cell Phones & Smartphones",
+        item_specifics={
+            "Brand": "Samsung",
+            "Model": "Samsung Galaxy A16",
+            "Storage": "128 GB",
+            "Network": "Unlocked",
+        },
+    )
+    candidates = [
+        {
+            "title": "Samsung Galaxy A16 128GB Straight Talk Smartphone",
+            "brand": "Samsung",
+            "identifiers": {"UPC": "123456789012"},
+        }
+    ]
+
+    match, reason = select_verified_catalog_match(item, candidates)
+
+    assert match is None
+    assert "carrier" in reason
+
+
+def test_parse_walmart_product_page_extracts_upc_and_shipping_weight():
+    page = """
+    <html><head>
+      <script type="application/ld+json">
+        {"@context":"https://schema.org","@type":"Product","name":"Samsung Phone",
+         "brand":{"@type":"Brand","name":"Samsung"},"model":"SM-A166U1",
+         "gtin13":"616960559061"}
+      </script>
+    </head><body>
+      <script>window.__DATA__={"name":"Assembled product weight","value":"7.05 oz"}</script>
+    </body></html>
+    """
+
+    result = parse_walmart_product_page(page)
+
+    assert result["identifiers"] == {"UPC": "616960559061"}
+    assert result["brand"] == "Samsung"
+    assert result["model"] == "SM-A166U1"
+    assert result["shipping_weight_lbs"] == 0.441
+
+
+def test_estimated_shipping_weight_is_conservative_by_category():
+    assert estimated_shipping_weight_lbs(
+        InventoryItem(sku="PHONE", title="Apple iPhone 16", category="Smartphones")
+    ) == 2.0
+    assert estimated_shipping_weight_lbs(
+        InventoryItem(sku="LAPTOP", title="Apple MacBook Pro", category="Computers")
+    ) == 10.0
 
 
 class FakeAsyncClient:

@@ -91,6 +91,12 @@ CREATE TABLE IF NOT EXISTS walmart_listing_drafts (
     status TEXT NOT NULL,
     missing_fields TEXT NOT NULL DEFAULT '[]',
     lookup_error TEXT,
+    publish_status TEXT NOT NULL DEFAULT 'not_submitted',
+    publish_attempts INTEGER NOT NULL DEFAULT 0,
+    offer_feed_id TEXT,
+    inventory_feed_id TEXT,
+    publish_error TEXT,
+    last_publish_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -170,6 +176,7 @@ class InventoryRepository:
             connection.executescript(SCHEMA)
             self._ensure_inventory_columns(connection)
             self._ensure_marketplace_sync_columns(connection)
+            self._ensure_walmart_draft_columns(connection)
 
     def _ensure_inventory_columns(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -210,6 +217,27 @@ class InventoryRepository:
             connection.execute(
                 "ALTER TABLE marketplace_inventory_sync_state ADD COLUMN price_currency TEXT"
             )
+
+    def _ensure_walmart_draft_columns(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(walmart_listing_drafts)"
+            ).fetchall()
+        }
+        definitions = {
+            "publish_status": "TEXT NOT NULL DEFAULT 'not_submitted'",
+            "publish_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "offer_feed_id": "TEXT",
+            "inventory_feed_id": "TEXT",
+            "publish_error": "TEXT",
+            "last_publish_at": "TEXT",
+        }
+        for name, definition in definitions.items():
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE walmart_listing_drafts ADD COLUMN {name} {definition}"
+                )
 
     def count(self) -> int:
         with self.connect() as connection:
@@ -539,6 +567,14 @@ class InventoryRepository:
                 ORDER BY catalog_status
                 """
             ).fetchall()
+            publish_rows = connection.execute(
+                """
+                SELECT publish_status, COUNT(*) AS total
+                FROM walmart_listing_drafts
+                GROUP BY publish_status
+                ORDER BY publish_status
+                """
+            ).fetchall()
             latest_row = connection.execute(
                 "SELECT MAX(updated_at) AS latest_updated_at FROM walmart_listing_drafts"
             ).fetchone()
@@ -547,6 +583,9 @@ class InventoryRepository:
             "by_status": {str(row["status"]): int(row["total"]) for row in status_rows},
             "by_catalog_status": {
                 str(row["catalog_status"]): int(row["total"]) for row in catalog_rows
+            },
+            "by_publish_status": {
+                str(row["publish_status"]): int(row["total"]) for row in publish_rows
             },
             "latest_updated_at": latest_row["latest_updated_at"],
         }
@@ -564,6 +603,46 @@ class InventoryRepository:
                 WHERE sku IN ({', '.join('?' for _ in selected_skus)})
                 """,
                 (status, now, *selected_skus),
+            )
+        return int(cursor.rowcount)
+
+    def update_walmart_draft_publish_state(
+        self,
+        skus: Iterable[str],
+        publish_status: str,
+        *,
+        offer_feed_id: str | None = None,
+        inventory_feed_id: str | None = None,
+        error_message: str | None = None,
+        increment_attempts: bool = False,
+    ) -> int:
+        selected_skus = [str(sku).strip() for sku in skus if str(sku).strip()]
+        if not selected_skus:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"""
+                UPDATE walmart_listing_drafts
+                SET publish_status = ?,
+                    publish_attempts = publish_attempts + ?,
+                    offer_feed_id = COALESCE(?, offer_feed_id),
+                    inventory_feed_id = COALESCE(?, inventory_feed_id),
+                    publish_error = ?,
+                    last_publish_at = ?,
+                    updated_at = ?
+                WHERE sku IN ({', '.join('?' for _ in selected_skus)})
+                """,
+                (
+                    str(publish_status),
+                    1 if increment_attempts else 0,
+                    offer_feed_id,
+                    inventory_feed_id,
+                    error_message,
+                    now,
+                    now,
+                    *selected_skus,
+                ),
             )
         return int(cursor.rowcount)
 

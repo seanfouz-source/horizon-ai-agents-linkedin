@@ -197,6 +197,20 @@ def test_walmart_drafts_are_persisted_and_summarized(tmp_path):
     assert summary["total"] == 1
     assert summary["by_status"] == {"draft_needs_review": 1}
     assert summary["by_catalog_status"] == {"candidates_found": 1}
+    assert summary["by_publish_status"] == {"not_submitted": 1}
+
+    repository.update_walmart_draft_publish_state(
+        ["EBAY-123-GRAY"],
+        "submitted",
+        offer_feed_id="OFFER-1",
+        inventory_feed_id="INVENTORY-1",
+        increment_attempts=True,
+    )
+    submitted = repository.walmart_drafts()[0]
+    assert submitted["publish_status"] == "submitted"
+    assert submitted["publish_attempts"] == 1
+    assert submitted["offer_feed_id"] == "OFFER-1"
+    assert repository.walmart_draft_summary()["by_publish_status"] == {"submitted": 1}
 
 
 def test_walmart_unpublished_job_is_persistent_and_idempotent(tmp_path):

@@ -85,6 +85,12 @@ class WalmartDraftGenerateRequest(BaseModel):
     catalog_candidates_per_item: int = Field(default=5, ge=1, le=10)
 
 
+class WalmartAutoPublishRequest(BaseModel):
+    max_items: int = Field(default=200, ge=1, le=200)
+    sync_ebay_first: bool = True
+    confirm: bool = False
+
+
 class CustomerQuestion(BaseModel):
     message: str
     channel: Channel = "unknown"

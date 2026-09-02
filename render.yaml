@@ -87,6 +87,18 @@ services:
         value: "true"
       - key: WALMART_UNPUBLISHED_BATCH_ID
         value: ebay-api-public-upc-zero-inventory-2026-07-22
+      - key: WALMART_AUTO_PUBLISH_ENABLED
+        value: "true"
+      - key: WALMART_AUTO_PUBLISH_INTERVAL_SECONDS
+        value: "21600"
+      - key: WALMART_AUTO_PUBLISH_INITIAL_DELAY_SECONDS
+        value: "900"
+      - key: WALMART_AUTO_PUBLISH_BATCH_SIZE
+        value: "200"
+      - key: WALMART_AUTO_PUBLISH_CATALOG_LIMIT
+        value: "250"
+      - key: WALMART_AUTO_PUBLISH_EXCLUDED_TERMS
+        value: don toliver,don oliver,otterbox
       - key: MARKETPLACE_INVENTORY_SYNC_ENABLED
         value: "true"
       - key: MARKETPLACE_INVENTORY_SYNC_INTERVAL_SECONDS

@@ -49,6 +49,7 @@ from app.models import (
     SlowMoverOutreachRequest,
     SocialDraftBatch,
     SocialDraftRequest,
+    WalmartAutoPublishRequest,
     WalmartImportRequest,
     WalmartDraftGenerateRequest,
     WalmartInventorySyncRequest,
@@ -79,6 +80,9 @@ from app.walmart import (
     build_walmart_draft,
     build_inventory_feed,
     build_offer_match_preview,
+    estimated_shipping_weight_lbs,
+    plausible_catalog_candidates,
+    select_verified_catalog_match,
 )
 from app.walmart_public_data import PUBLIC_CATALOG_IDENTIFIERS
 
@@ -131,6 +135,13 @@ walmart_unpublished_status: dict[str, Any] = repository.latest_walmart_unpublish
     "status": "not_authorized",
     "message": "No one-time zero-inventory Walmart offer batch has been authorized.",
 }
+walmart_auto_publish_status: dict[str, Any] = {
+    "status": "not_run",
+    "enabled": settings.walmart_auto_publish_enabled,
+    "interval_seconds": settings.walmart_auto_publish_interval_seconds,
+    "catalog_limit": settings.walmart_auto_publish_catalog_limit,
+    "last_attempt_at": None,
+}
 marketplace_inventory_sync_status: dict[str, Any] = {
     "status": "not_run",
     "enabled": settings.marketplace_inventory_sync_enabled,
@@ -138,6 +149,7 @@ marketplace_inventory_sync_status: dict[str, Any] = {
     "last_attempt_at": None,
 }
 marketplace_inventory_sync_lock = asyncio.Lock()
+walmart_auto_publish_lock = asyncio.Lock()
 app = FastAPI(title=settings.app_name)
 logger = logging.getLogger(__name__)
 LISTING_PHOTO_DIRECTORY = Path(__file__).with_name("listing_photos")
@@ -178,6 +190,10 @@ def health() -> dict[str, Any]:
             "stored": repository.walmart_draft_summary(),
         },
         "walmart_unpublished": walmart_unpublished_status,
+        "walmart_auto_publish": {
+            **walmart_auto_publish_status,
+            "stored": repository.walmart_draft_summary(),
+        },
         "marketplace_inventory_sync": {
             **marketplace_inventory_sync_status,
             "stored": repository.marketplace_inventory_sync_summary(),
@@ -345,6 +361,8 @@ async def startup_inventory_sync() -> None:
     asyncio.create_task(_startup_walmart_auth_check())
     if settings.marketplace_inventory_sync_enabled:
         asyncio.create_task(_marketplace_inventory_sync_loop())
+    if settings.walmart_auto_publish_enabled and walmart_client.configured:
+        asyncio.create_task(_walmart_auto_publish_loop())
 
 
 async def _startup_walmart_auth_check() -> None:
@@ -411,6 +429,26 @@ async def _marketplace_inventory_sync_loop() -> None:
             raise
         except Exception as exc:
             logger.warning("Marketplace inventory sync failed: %s", exc)
+        await asyncio.sleep(interval)
+
+
+async def _walmart_auto_publish_loop() -> None:
+    initial_delay = max(60, int(settings.walmart_auto_publish_initial_delay_seconds))
+    interval = max(900, int(settings.walmart_auto_publish_interval_seconds))
+    await asyncio.sleep(initial_delay)
+    while True:
+        try:
+            await _run_walmart_auto_publish_once(
+                WalmartAutoPublishRequest(
+                    max_items=max(1, min(int(settings.walmart_auto_publish_batch_size), 200)),
+                    sync_ebay_first=True,
+                    confirm=True,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Walmart automatic draft publishing failed: %s", exc)
         await asyncio.sleep(interval)
 
 
@@ -753,6 +791,456 @@ async def _generate_walmart_drafts(
         "walmart_feed_submitted": False,
         "drafts": drafts,
     }
+
+
+def _walmart_auto_publish_exclusion(item: InventoryItem) -> str | None:
+    terms = [
+        term.strip().lower()
+        for term in str(settings.walmart_auto_publish_excluded_terms or "").split(",")
+        if term.strip()
+    ]
+    searchable = " ".join(
+        (
+            item.title or "",
+            item.description or "",
+            item.category or "",
+            " ".join(str(value or "") for value in item.item_specifics.values()),
+        )
+    ).lower()
+    return next((term for term in terms if term in searchable), None)
+
+
+async def _resolve_walmart_auto_publish_draft(
+    item: InventoryItem,
+    draft: dict[str, Any],
+) -> tuple[WalmartItemOverride | None, dict[str, Any], dict[str, Any]]:
+    prepared = dict(draft.get("prepared_listing") or {})
+    candidates = [
+        dict(candidate)
+        for candidate in (draft.get("catalog_candidates") or [])
+        if isinstance(candidate, dict)
+    ]
+    identifier = prepared.get("product_identifier")
+    identifier_source: str | None = None
+    product_id_type: str | None = None
+    product_id: str | None = None
+    matched_candidate: dict[str, Any] | None = None
+
+    if isinstance(identifier, dict):
+        product_id_type = str(identifier.get("type") or "").strip().upper() or None
+        product_id = str(identifier.get("value") or "").strip() or None
+        if product_id_type and product_id:
+            identifier_source = "ebay_or_stored_draft"
+
+    public_identifier = PUBLIC_CATALOG_IDENTIFIERS.get(item.sku)
+    if not product_id and public_identifier:
+        product_id_type = str(public_identifier["product_id_type"])
+        product_id = str(public_identifier["product_id"])
+        identifier_source = "reviewed_public_identifier"
+
+    if not product_id:
+        verified_match, _ = select_verified_catalog_match(item, candidates)
+        if verified_match:
+            matched_candidate = verified_match
+        else:
+            plausible, plausible_reason = plausible_catalog_candidates(item, candidates)
+            if len(plausible) != 1:
+                return None, draft, {
+                    "sku": item.sku,
+                    "ready": False,
+                    "reason": plausible_reason,
+                }
+            if not plausible[0].get("walmart_item_id"):
+                return None, draft, {
+                    "sku": item.sku,
+                    "ready": False,
+                    "reason": "The exact catalog candidate did not include a Walmart item ID.",
+                }
+            try:
+                enriched = await walmart_client.enrich_catalog_candidate(plausible[0])
+            except WalmartApiError as exc:
+                return None, draft, {
+                    "sku": item.sku,
+                    "ready": False,
+                    "reason": f"Could not enrich the exact Walmart candidate: {exc}",
+                }
+            candidates = [
+                enriched if candidate is plausible[0] else candidate
+                for candidate in candidates
+            ]
+            matched_candidate, match_reason = select_verified_catalog_match(item, candidates)
+            if not matched_candidate:
+                return None, {**draft, "catalog_candidates": candidates}, {
+                    "sku": item.sku,
+                    "ready": False,
+                    "reason": match_reason,
+                }
+        product_id_type = str(matched_candidate["product_id_type"])
+        product_id = str(matched_candidate["product_id"])
+        identifier_source = "exact_walmart_catalog_candidate"
+
+    shipping_weight = prepared.get("shipping_weight_lbs")
+    weight_source = "ebay_or_stored_draft"
+    if shipping_weight is None and matched_candidate:
+        shipping_weight = matched_candidate.get("shipping_weight_lbs")
+        if shipping_weight is not None:
+            weight_source = "walmart_public_product_page"
+    if shipping_weight is None:
+        shipping_weight = estimated_shipping_weight_lbs(item)
+        weight_source = "conservative_category_estimate"
+
+    prepared["product_identifier"] = {
+        "type": product_id_type,
+        "value": product_id,
+    }
+    if product_id_type not in {"GTIN", "UPC", "EAN", "ISBN"}:
+        return None, draft, {
+            "sku": item.sku,
+            "ready": False,
+            "reason": "The resolved product identifier type is not supported by Walmart.",
+        }
+    try:
+        resolved_shipping_weight = float(shipping_weight)
+    except (TypeError, ValueError):
+        return None, draft, {
+            "sku": item.sku,
+            "ready": False,
+            "reason": "The resolved shipping weight was not numeric.",
+        }
+    prepared["shipping_weight_lbs"] = resolved_shipping_weight
+    missing_fields = [
+        field
+        for field in (draft.get("missing_fields") or [])
+        if field not in {"product_identifier", "shipping_weight_lbs"}
+    ]
+    updated_draft = {
+        **draft,
+        "prepared_listing": prepared,
+        "catalog_candidates": candidates,
+        "status": "draft_ready_to_publish",
+        "missing_fields": missing_fields,
+        "lookup_error": None,
+    }
+    override = WalmartItemOverride(
+        product_id_type=product_id_type,
+        product_id=product_id,
+        shipping_weight_lbs=resolved_shipping_weight,
+    )
+    return override, updated_draft, {
+        "sku": item.sku,
+        "ready": True,
+        "identifier_source": identifier_source,
+        "weight_source": weight_source,
+        "estimated_shipping_weight": weight_source == "conservative_category_estimate",
+    }
+
+
+async def _run_walmart_auto_publish_once(
+    auto_request: WalmartAutoPublishRequest,
+) -> dict[str, Any]:
+    global walmart_auto_publish_status, walmart_sync_status
+    attempted_at = datetime.now(timezone.utc).isoformat()
+    if walmart_auto_publish_lock.locked():
+        return {**walmart_auto_publish_status, "status": "already_running"}
+    if not walmart_client.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="WALMART_CLIENT_ID and WALMART_CLIENT_SECRET are not configured.",
+        )
+
+    async with walmart_auto_publish_lock:
+        ebay_refresh: dict[str, Any] | None = None
+        if auto_request.sync_ebay_first:
+            ebay_refresh = await _sync_ebay_api_inventory()
+            if ebay_refresh.get("status") != "ok":
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "message": "The eBay refresh failed, so no Walmart drafts were submitted.",
+                        "ebay_sync": ebay_refresh,
+                    },
+                )
+
+        generation = await _generate_walmart_drafts(
+            WalmartDraftGenerateRequest(
+                max_items=auto_request.max_items,
+                sync_ebay_first=False,
+                search_walmart_catalog=True,
+                catalog_candidates_per_item=5,
+            )
+        )
+        active_items = repository.ebay_items(
+            limit=auto_request.max_items,
+            include_inactive=False,
+        )
+        drafts_by_sku = {
+            str(draft["sku"]): draft
+            for draft in repository.walmart_drafts(
+                [item.sku for item in active_items],
+                limit=auto_request.max_items,
+            )
+        }
+        try:
+            published_items = await walmart_client.list_published_items(
+                limit=max(1, min(int(settings.walmart_auto_publish_catalog_limit), 1000))
+            )
+        except WalmartApiError as exc:
+            raise _walmart_http_error(exc) from exc
+        published_skus = {
+            str(item.get("sku") or "").strip()
+            for item in published_items
+            if str(item.get("sku") or "").strip()
+        }
+        repository.update_walmart_draft_publish_state(published_skus, "published")
+
+        excluded: list[dict[str, Any]] = []
+        already_published: list[str] = []
+        awaiting_walmart: list[str] = []
+        pending_inventory_items: list[InventoryItem] = []
+        candidates_to_resolve: list[tuple[InventoryItem, dict[str, Any]]] = []
+        nonrepeatable_states = {
+            "submitting_offer",
+            "submitted",
+            "processing",
+        }
+        for item in active_items:
+            exclusion = _walmart_auto_publish_exclusion(item)
+            if exclusion:
+                excluded.append({"sku": item.sku, "matched_term": exclusion})
+                repository.update_walmart_draft_publish_state([item.sku], "excluded")
+                continue
+            if item.sku in published_skus:
+                already_published.append(item.sku)
+                continue
+            draft = drafts_by_sku.get(item.sku)
+            if not draft:
+                continue
+            publish_status = str(draft.get("publish_status") or "")
+            if publish_status == "offer_submitted_inventory_pending":
+                awaiting_walmart.append(item.sku)
+                pending_inventory_items.append(item)
+                continue
+            if publish_status in nonrepeatable_states:
+                awaiting_walmart.append(item.sku)
+                continue
+            candidates_to_resolve.append((item, draft))
+
+        submitted_not_published = {
+            sku
+            for sku in awaiting_walmart
+            if sku not in published_skus
+        }
+        available_slots = max(
+            0,
+            int(settings.walmart_auto_publish_catalog_limit)
+            - len(published_skus | submitted_not_published),
+        )
+
+        enrichment_semaphore = asyncio.Semaphore(4)
+
+        async def resolve_one(
+            item: InventoryItem,
+            draft: dict[str, Any],
+        ) -> tuple[InventoryItem, WalmartItemOverride | None, dict[str, Any], dict[str, Any]]:
+            async with enrichment_semaphore:
+                override, updated_draft, result = await _resolve_walmart_auto_publish_draft(
+                    item, draft
+                )
+            return item, override, updated_draft, result
+
+        resolved_rows = await asyncio.gather(
+            *(resolve_one(item, draft) for item, draft in candidates_to_resolve)
+        )
+        if resolved_rows:
+            repository.upsert_walmart_drafts(row[2] for row in resolved_rows)
+
+        resolution_results: list[dict[str, Any]] = []
+        overrides: dict[str, WalmartItemOverride] = {}
+        for item, override, _draft, result in resolved_rows:
+            if override is None:
+                repository.update_walmart_draft_publish_state(
+                    [item.sku], "blocked_missing_info", error_message=str(result.get("reason") or "")
+                )
+            elif len(overrides) < available_slots:
+                overrides[item.sku] = override
+            else:
+                result = {
+                    **result,
+                    "ready": False,
+                    "reason": "The configured 250-item Walmart catalog limit has been reached.",
+                }
+                repository.update_walmart_draft_publish_state(
+                    [item.sku], "blocked_catalog_limit", error_message=result["reason"]
+                )
+            resolution_results.append(result)
+
+        candidate_skus = list(overrides)
+        preflight: dict[str, Any] | None = None
+        ready_skus: list[str] = []
+        if candidate_skus:
+            preflight = await _prepare_walmart_import(
+                WalmartImportRequest(
+                    skus=candidate_skus,
+                    overrides=overrides,
+                    max_items=len(candidate_skus),
+                    sync_ebay_first=False,
+                    verify_catalog=True,
+                ),
+                force_verify_catalog=True,
+            )
+            ready_skus = [
+                str(item["sku"])
+                for item in preflight["items"]
+                if item.get("ready")
+            ]
+            blocked_preflight = [
+                item
+                for item in preflight["items"]
+                if not item.get("ready")
+            ]
+            for item in blocked_preflight:
+                repository.update_walmart_draft_publish_state(
+                    [str(item["sku"])],
+                    "blocked_preflight",
+                    error_message="; ".join(str(error) for error in item.get("errors") or []),
+                )
+            repository.update_walmart_draft_publish_state(ready_skus, "ready")
+
+        base_result: dict[str, Any] = {
+            "status": "previewed" if not auto_request.confirm else "no_ready_items",
+            "enabled": settings.walmart_auto_publish_enabled,
+            "confirm": auto_request.confirm,
+            "generated_drafts": int(generation.get("generated") or 0),
+            "active_ebay_items": len(active_items),
+            "published_walmart_items": len(published_skus),
+            "catalog_limit": int(settings.walmart_auto_publish_catalog_limit),
+            "available_catalog_slots": available_slots,
+            "already_published": already_published,
+            "awaiting_walmart": awaiting_walmart,
+            "excluded": excluded,
+            "resolved": resolution_results,
+            "ready_skus": ready_skus,
+            "blocked_items": (preflight or {}).get("blocked", 0),
+            "ebay_sync": ebay_refresh,
+            "offer_feed_id": None,
+            "inventory_feed_id": None,
+            "last_attempt_at": attempted_at,
+        }
+
+        retried_inventory_feed_id: str | None = None
+        if auto_request.confirm and pending_inventory_items:
+            pending_skus = [item.sku for item in pending_inventory_items]
+            try:
+                pending_submission = await walmart_client.submit_inventory_feed(
+                    build_inventory_feed(pending_inventory_items)
+                )
+            except WalmartApiError as exc:
+                repository.update_walmart_draft_publish_state(
+                    pending_skus,
+                    "offer_submitted_inventory_pending",
+                    error_message=str(exc),
+                )
+            else:
+                retried_inventory_feed_id = str(pending_submission["feed_id"])
+                repository.update_walmart_draft_publish_state(
+                    pending_skus,
+                    "submitted",
+                    inventory_feed_id=retried_inventory_feed_id,
+                )
+                base_result["retried_inventory_skus"] = pending_skus
+                base_result["retried_inventory_feed_id"] = retried_inventory_feed_id
+                base_result["awaiting_walmart"] = [
+                    sku for sku in awaiting_walmart if sku not in set(pending_skus)
+                ]
+
+        if not auto_request.confirm or not ready_skus:
+            if retried_inventory_feed_id:
+                base_result["status"] = "inventory_retry_submitted"
+            walmart_auto_publish_status = base_result
+            return base_result
+
+        ready_set = set(ready_skus)
+        offer_entries = [
+            entry
+            for entry in preflight["payload"]["MPItem"]
+            if entry.get("Item", {}).get("sku") in ready_set
+        ]
+        offer_payload = {**preflight["payload"], "MPItem": offer_entries}
+        repository.update_walmart_draft_publish_state(
+            ready_skus,
+            "submitting_offer",
+            increment_attempts=True,
+        )
+        try:
+            offer_submission = await walmart_client.submit_offer_match_feed(offer_payload)
+        except WalmartApiError as exc:
+            repository.update_walmart_draft_publish_state(
+                ready_skus, "offer_failed", error_message=str(exc)
+            )
+            walmart_auto_publish_status = {
+                **base_result,
+                "status": "offer_failed",
+                "message": str(exc),
+            }
+            raise _walmart_http_error(exc) from exc
+
+        offer_feed_id = str(offer_submission["feed_id"])
+        repository.update_walmart_draft_publish_state(
+            ready_skus,
+            "offer_submitted_inventory_pending",
+            offer_feed_id=offer_feed_id,
+        )
+        ready_items = repository.ebay_items(
+            ready_skus,
+            limit=len(ready_skus),
+            include_inactive=False,
+        )
+        try:
+            inventory_submission = await walmart_client.submit_inventory_feed(
+                build_inventory_feed(ready_items)
+            )
+        except WalmartApiError as exc:
+            repository.update_walmart_draft_publish_state(
+                ready_skus,
+                "offer_submitted_inventory_pending",
+                offer_feed_id=offer_feed_id,
+                error_message=str(exc),
+            )
+            walmart_auto_publish_status = {
+                **base_result,
+                "status": "offer_submitted_inventory_pending",
+                "offer_feed_id": offer_feed_id,
+                "message": str(exc),
+            }
+            raise _walmart_http_error(exc) from exc
+
+        inventory_feed_id = str(inventory_submission["feed_id"])
+        repository.update_walmart_draft_publish_state(
+            ready_skus,
+            "submitted",
+            offer_feed_id=offer_feed_id,
+            inventory_feed_id=inventory_feed_id,
+        )
+        walmart_auto_publish_status = {
+            **base_result,
+            "status": "submitted",
+            "submitted_items": len(ready_skus),
+            "submitted_skus": ready_skus,
+            "offer_feed_id": offer_feed_id,
+            "inventory_feed_id": inventory_feed_id,
+            "message": "Walmart offer and current eBay inventory feeds were submitted.",
+        }
+        walmart_sync_status = {
+            "status": "auto_publish_submitted",
+            "configured": True,
+            "last_submission": {
+                "offer_feed_id": offer_feed_id,
+                "inventory_feed_id": inventory_feed_id,
+            },
+            "submitted_items": len(ready_skus),
+            "last_attempt_at": attempted_at,
+        }
+        return walmart_auto_publish_status
 
 
 async def _submit_unpublished_batch_once(batch_id: str) -> dict[str, Any]:
@@ -1366,10 +1854,10 @@ def walmart_drafts_summary() -> dict[str, Any]:
         "status": walmart_draft_status,
         "stored": repository.walmart_draft_summary(),
         "storage": "render_database",
-        "walmart_feed_submitted": False,
+        "walmart_feed_submitted": walmart_auto_publish_status.get("status") == "submitted",
         "note": (
             "Walmart Marketplace APIs do not expose Seller Center draft creation. "
-            "These API-enriched records remain staged until a separate confirmed publish request."
+            "The automatic publisher submits only unique, exact catalog matches and leaves ambiguous records staged."
         ),
     }
 
@@ -1450,6 +1938,33 @@ async def generate_walmart_drafts(
 ) -> dict[str, Any]:
     verify_secret(x_horizon_secret, request.query_params.get("secret"))
     return await _generate_walmart_drafts(draft_request)
+
+
+@app.get("/walmart/auto-publish/status")
+def walmart_auto_publish_current_status() -> dict[str, Any]:
+    return {
+        **walmart_auto_publish_status,
+        "enabled": settings.walmart_auto_publish_enabled,
+        "interval_seconds": max(900, int(settings.walmart_auto_publish_interval_seconds)),
+        "initial_delay_seconds": max(60, int(settings.walmart_auto_publish_initial_delay_seconds)),
+        "catalog_limit": int(settings.walmart_auto_publish_catalog_limit),
+        "excluded_terms": [
+            term.strip()
+            for term in str(settings.walmart_auto_publish_excluded_terms or "").split(",")
+            if term.strip()
+        ],
+        "stored": repository.walmart_draft_summary(),
+    }
+
+
+@app.post("/walmart/auto-publish/run")
+async def run_walmart_auto_publish(
+    auto_request: WalmartAutoPublishRequest,
+    request: Request,
+    x_horizon_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_secret(x_horizon_secret, request.query_params.get("secret"))
+    return await _run_walmart_auto_publish_once(auto_request)
 
 
 @app.post("/walmart/import/preview")

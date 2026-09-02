@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     walmart_price_markup_percent: float = 10.0
     walmart_stage_drafts_on_startup: bool = True
     walmart_unpublished_batch_id: str | None = None
+    walmart_auto_publish_enabled: bool = True
+    walmart_auto_publish_interval_seconds: int = 21600
+    walmart_auto_publish_initial_delay_seconds: int = 900
+    walmart_auto_publish_batch_size: int = 200
+    walmart_auto_publish_catalog_limit: int = 250
+    walmart_auto_publish_excluded_terms: str = "don toliver,don oliver,otterbox"
     marketplace_inventory_sync_enabled: bool = True
     marketplace_inventory_sync_interval_seconds: int = 60
     seed_inventory_csv: Path | None = BASE_DIR / "data" / "exactspec_public_store.csv"
