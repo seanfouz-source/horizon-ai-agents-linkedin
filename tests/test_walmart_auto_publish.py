@@ -317,3 +317,87 @@ def test_online_identifier_lookup_is_walmart_verified_and_cached(monkeypatch, tm
     cached = repository.walmart_product_identifier_cache(item.sku)
     assert cached["verification_status"] == "verified"
     assert cached["lookup_attempts"] == 1
+
+
+def test_condition_specific_walmart_upc_is_replaced_with_original_identifier(
+    monkeypatch, tmp_path
+):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    item = InventoryItem(
+        sku="IPHONE-12-PRO-MAX",
+        title="Apple iPhone 12 Pro Max 128GB Pacific Blue Factory Unlocked Open Box",
+        condition="Open box",
+        price=400,
+        quantity=1,
+        image_url="https://example.com/iphone.jpg",
+        category="Cell Phones & Smartphones",
+        listing_status="ACTIVE",
+        item_specifics={
+            "Brand": "Apple",
+            "Model": "Apple iPhone 12 Pro Max",
+            "Storage": "128 GB",
+            "Device Color": "Pacific Blue",
+            "Network": "Unlocked",
+        },
+    )
+    draft = {
+        "sku": item.sku,
+        "source_snapshot": item.model_dump(mode="json"),
+        "prepared_listing": {"product_identifier": None, "shipping_weight_lbs": None},
+        "catalog_candidates": [
+            {
+                "title": "Pre-Owned Apple iPhone 12 Pro Max 128GB Unlocked Pacific Blue",
+                "brand": "Apple",
+                "identifiers": {"UPC": "683346583606"},
+            }
+        ],
+        "catalog_status": "candidates_found",
+        "status": "draft_needs_review",
+        "missing_fields": ["product_identifier", "shipping_weight_lbs"],
+    }
+
+    class FakeLookup:
+        configured = True
+
+        async def lookup(self, item, candidates):
+            return ProductIdentifierLookupResult(
+                status="verified",
+                product_id_type="UPC",
+                product_id="194252020432",
+                source_urls=["https://www.apple.com/example"],
+                matched_product="Apple iPhone 12 Pro Max 128GB Pacific Blue",
+                reason="Original retail identifier verified.",
+            )
+
+    monkeypatch.setattr(main_module, "repository", repository)
+    monkeypatch.setattr(main_module, "walmart_client", FakeWalmartClient())
+    monkeypatch.setattr(main_module, "product_identifier_lookup", FakeLookup())
+    monkeypatch.setattr(main_module.settings, "walmart_gtin_lookup_enabled", True)
+    monkeypatch.setattr(main_module.settings, "walmart_gtin_lookup_retry_seconds", 604800)
+
+    override, _updated, result = asyncio.run(
+        main_module._resolve_walmart_auto_publish_draft(
+            item,
+            draft,
+            gtin_lookup_budget=main_module._WalmartGtinLookupBudget(1),
+        )
+    )
+
+    assert override.product_id == "194252020432"
+    assert override.product_id != "683346583606"
+    assert result["identifier_source"] == "verified_online_identifier"
+
+
+def test_original_product_identifier_walmart_error_is_eligible_for_research_retry():
+    assert main_module._walmart_original_identifier_retry(
+        {
+            "publish_status": "blocked_offer_error",
+            "publish_error": (
+                "A Pre-Owned item can only be created when the associated original product "
+                "is in New condition. The PCF is invalid/Not_eligible for processing"
+            ),
+        }
+    )
+    assert not main_module._walmart_original_identifier_retry(
+        {"publish_status": "blocked_offer_error", "publish_error": "Generic data error"}
+    )

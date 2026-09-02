@@ -825,6 +825,33 @@ def _walmart_auto_publish_exclusion(item: InventoryItem) -> str | None:
     return next((term for term in terms if term in searchable), None)
 
 
+def _condition_specific_catalog_candidate(candidate: dict[str, Any]) -> bool:
+    title = str(candidate.get("title") or "").strip().lower()
+    return any(
+        marker in title
+        for marker in (
+            "open box",
+            "open-box",
+            "pre-owned",
+            "preowned",
+            "refurbished",
+            "renewed",
+            "restored",
+            "used ",
+        )
+    )
+
+
+def _walmart_original_identifier_retry(draft: dict[str, Any]) -> bool:
+    if str(draft.get("publish_status") or "") != "blocked_offer_error":
+        return False
+    error = str(draft.get("publish_error") or "").lower()
+    return (
+        "associated original product is in new condition" in error
+        or "pcf is invalid/not_eligible" in error
+    )
+
+
 class _WalmartGtinLookupBudget:
     def __init__(self, maximum: int) -> None:
         self.maximum = max(0, int(maximum))
@@ -1089,7 +1116,12 @@ async def _resolve_walmart_auto_publish_draft(
                 catalog_resolution_reason = (
                     "The exact catalog candidate did not include a Walmart item ID."
                 )
-        if matched_candidate:
+        if matched_candidate and _condition_specific_catalog_candidate(matched_candidate):
+            catalog_resolution_reason = (
+                "The exact Walmart result is a condition-specific seller listing, so its "
+                "reseller UPC cannot be used as the original product identifier."
+            )
+        elif matched_candidate:
             product_id_type = str(matched_candidate["product_id_type"])
             product_id = str(matched_candidate["product_id"])
             identifier_source = "exact_walmart_catalog_candidate"
@@ -1501,7 +1533,9 @@ async def _run_walmart_auto_publish_once(
                 if not _walmart_publish_retry_due(draft):
                     awaiting_walmart.append(item.sku)
                     continue
-            if publish_status in nonrepeatable_states:
+            if publish_status in nonrepeatable_states and not _walmart_original_identifier_retry(
+                draft
+            ):
                 awaiting_walmart.append(item.sku)
                 continue
             candidates_to_resolve.append((item, draft))
