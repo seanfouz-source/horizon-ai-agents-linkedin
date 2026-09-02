@@ -85,6 +85,11 @@ from app.walmart import (
     select_verified_catalog_match,
 )
 from app.walmart_public_data import PUBLIC_CATALOG_IDENTIFIERS
+from app.walmart_feed_reconciliation import (
+    classify_walmart_inventory_result,
+    classify_walmart_offer_result,
+    walmart_feed_item_results,
+)
 
 
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
@@ -935,6 +940,205 @@ async def _resolve_walmart_auto_publish_draft(
     }
 
 
+async def _wait_for_walmart_feed(
+    feed_id: str,
+    *,
+    attempts: int = 20,
+    delay_seconds: float = 2.0,
+) -> dict[str, Any]:
+    latest: dict[str, Any] = {}
+    for attempt in range(max(1, attempts)):
+        latest = await walmart_client.get_feed_status(feed_id, include_details=True)
+        if str(latest.get("feedStatus") or "").upper() in {
+            "PROCESSED",
+            "ERROR",
+        }:
+            return latest
+        if attempt < attempts - 1:
+            await asyncio.sleep(delay_seconds)
+    return latest
+
+
+def _apply_walmart_offer_feed_results(
+    feed_payload: dict[str, Any],
+    expected_skus: set[str],
+) -> dict[str, str]:
+    states: dict[str, str] = {}
+    for sku, result in walmart_feed_item_results(feed_payload).items():
+        if sku not in expected_skus:
+            continue
+        state = classify_walmart_offer_result(result)
+        states[sku] = state
+        repository.update_walmart_draft_publish_state(
+            [sku],
+            state,
+            error_message=result.get("error_message") or None,
+        )
+    return states
+
+
+def _apply_walmart_inventory_feed_results(
+    feed_payload: dict[str, Any],
+    eligible_skus: set[str],
+) -> dict[str, str]:
+    states: dict[str, str] = {}
+    for sku, result in walmart_feed_item_results(feed_payload).items():
+        if sku not in eligible_skus:
+            continue
+        state = classify_walmart_inventory_result(result)
+        states[sku] = state
+        repository.update_walmart_draft_publish_state(
+            [sku],
+            state,
+            error_message=result.get("error_message") or None,
+        )
+    return states
+
+
+async def _reconcile_walmart_auto_publish_feeds(
+    *,
+    confirm_inventory_actions: bool,
+) -> dict[str, Any]:
+    drafts = repository.walmart_drafts(limit=200)
+    existing_states = {
+        str(draft.get("sku") or "").strip(): str(draft.get("publish_status") or "")
+        for draft in drafts
+    }
+    offer_groups: dict[str, set[str]] = {}
+    inventory_groups: dict[str, set[str]] = {}
+    for draft in drafts:
+        sku = str(draft.get("sku") or "").strip()
+        offer_feed_id = str(draft.get("offer_feed_id") or "").strip()
+        inventory_feed_id = str(draft.get("inventory_feed_id") or "").strip()
+        if sku and offer_feed_id:
+            offer_groups.setdefault(offer_feed_id, set()).add(sku)
+        if sku and inventory_feed_id:
+            inventory_groups.setdefault(inventory_feed_id, set()).add(sku)
+
+    offer_states: dict[str, str] = {}
+    inventory_states: dict[str, str] = {}
+    feed_errors: dict[str, str] = {}
+    for feed_id, skus in offer_groups.items():
+        try:
+            payload = await walmart_client.get_feed_status(feed_id, include_details=True)
+        except WalmartApiError as exc:
+            feed_errors[feed_id] = str(exc)
+            continue
+        if str(payload.get("feedStatus") or "").upper() == "PROCESSED":
+            active_skus = {
+                sku
+                for sku in skus
+                if existing_states.get(sku)
+                not in {"published", "excluded", "blocked_product_id_conflict_remediated"}
+            }
+            offer_states.update(_apply_walmart_offer_feed_results(payload, active_skus))
+
+    conflict_inventory_success: set[str] = set()
+    for feed_id, skus in inventory_groups.items():
+        try:
+            payload = await walmart_client.get_feed_status(feed_id, include_details=True)
+        except WalmartApiError as exc:
+            feed_errors[feed_id] = str(exc)
+            continue
+        if str(payload.get("feedStatus") or "").upper() != "PROCESSED":
+            continue
+        results = walmart_feed_item_results(payload)
+        eligible = {
+            sku
+            for sku in skus
+            if offer_states.get(sku) == "offer_processed_inventory_pending"
+        }
+        inventory_states.update(_apply_walmart_inventory_feed_results(payload, eligible))
+        conflict_inventory_success.update(
+            sku
+            for sku, result in results.items()
+            if sku in skus
+            and offer_states.get(sku) == "blocked_product_id_conflict"
+            and str(result.get("status") or "").upper() == "SUCCESS"
+        )
+
+    retry_inventory_skus = {
+        sku
+        for sku, state in offer_states.items()
+        if state == "offer_processed_inventory_pending"
+        and inventory_states.get(sku) != "submitted"
+    }
+    remediation_feed_id: str | None = None
+    retry_inventory_feed_id: str | None = None
+    retry_inventory_states: dict[str, str] = {}
+    remediation_states: dict[str, str] = {}
+    if confirm_inventory_actions and conflict_inventory_success:
+        conflict_items = repository.ebay_items(
+            conflict_inventory_success,
+            limit=len(conflict_inventory_success),
+            include_inactive=True,
+        )
+        zero_items = [item.model_copy(update={"quantity": 0}) for item in conflict_items]
+        if zero_items:
+            submission = await walmart_client.submit_inventory_feed(
+                build_inventory_feed(zero_items)
+            )
+            remediation_feed_id = str(submission["feed_id"])
+            repository.update_walmart_draft_publish_state(
+                [item.sku for item in zero_items],
+                "blocked_product_id_conflict",
+                inventory_feed_id=remediation_feed_id,
+                error_message=(
+                    "Walmart retained a different product under this SKU; inventory was reset to zero."
+                ),
+            )
+            remediation_payload = await _wait_for_walmart_feed(remediation_feed_id)
+            remediation_states = {
+                sku: str(result.get("status") or "UNKNOWN")
+                for sku, result in walmart_feed_item_results(remediation_payload).items()
+            }
+            remediated_skus = [
+                sku for sku, status in remediation_states.items() if status == "SUCCESS"
+            ]
+            repository.update_walmart_draft_publish_state(
+                remediated_skus,
+                "blocked_product_id_conflict_remediated",
+                inventory_feed_id=remediation_feed_id,
+                error_message=(
+                    "Walmart retained a different product under this SKU; inventory was reset to zero."
+                ),
+            )
+
+    if confirm_inventory_actions and retry_inventory_skus:
+        retry_items = repository.ebay_items(
+            retry_inventory_skus,
+            limit=len(retry_inventory_skus),
+            include_inactive=False,
+        )
+        if retry_items:
+            submission = await walmart_client.submit_inventory_feed(
+                build_inventory_feed(retry_items)
+            )
+            retry_inventory_feed_id = str(submission["feed_id"])
+            repository.update_walmart_draft_publish_state(
+                [item.sku for item in retry_items],
+                "offer_processed_inventory_pending",
+                inventory_feed_id=retry_inventory_feed_id,
+            )
+            retry_payload = await _wait_for_walmart_feed(retry_inventory_feed_id)
+            retry_inventory_states = _apply_walmart_inventory_feed_results(
+                retry_payload,
+                {item.sku for item in retry_items},
+            )
+
+    return {
+        "offer_states": offer_states,
+        "inventory_states": inventory_states,
+        "feed_errors": feed_errors,
+        "inventory_retry_skus": sorted(retry_inventory_skus),
+        "inventory_retry_feed_id": retry_inventory_feed_id,
+        "inventory_retry_states": retry_inventory_states,
+        "inventory_remediation_skus": sorted(conflict_inventory_success),
+        "inventory_remediation_feed_id": remediation_feed_id,
+        "inventory_remediation_states": remediation_states,
+    }
+
+
 async def _run_walmart_auto_publish_once(
     auto_request: WalmartAutoPublishRequest,
 ) -> dict[str, Any]:
@@ -960,6 +1164,10 @@ async def _run_walmart_auto_publish_once(
                         "ebay_sync": ebay_refresh,
                     },
                 )
+
+        reconciliation = await _reconcile_walmart_auto_publish_feeds(
+            confirm_inventory_actions=auto_request.confirm
+        )
 
         generation = await _generate_walmart_drafts(
             WalmartDraftGenerateRequest(
@@ -996,12 +1204,18 @@ async def _run_walmart_auto_publish_once(
         excluded: list[dict[str, Any]] = []
         already_published: list[str] = []
         awaiting_walmart: list[str] = []
-        pending_inventory_items: list[InventoryItem] = []
         candidates_to_resolve: list[tuple[InventoryItem, dict[str, Any]]] = []
         nonrepeatable_states = {
             "submitting_offer",
+            "offer_processed_inventory_pending",
+            "offer_submitted_inventory_pending",
             "submitted",
             "processing",
+            "blocked_product_id_conflict",
+            "blocked_product_id_conflict_remediated",
+            "compliance_review",
+            "blocked_offer_error",
+            "blocked_inventory_error",
         }
         for item in active_items:
             exclusion = _walmart_auto_publish_exclusion(item)
@@ -1016,10 +1230,6 @@ async def _run_walmart_auto_publish_once(
             if not draft:
                 continue
             publish_status = str(draft.get("publish_status") or "")
-            if publish_status == "offer_submitted_inventory_pending":
-                awaiting_walmart.append(item.sku)
-                pending_inventory_items.append(item)
-                continue
             if publish_status in nonrepeatable_states:
                 awaiting_walmart.append(item.sku)
                 continue
@@ -1122,40 +1332,13 @@ async def _run_walmart_auto_publish_once(
             "ready_skus": ready_skus,
             "blocked_items": (preflight or {}).get("blocked", 0),
             "ebay_sync": ebay_refresh,
+            "reconciliation": reconciliation,
             "offer_feed_id": None,
             "inventory_feed_id": None,
             "last_attempt_at": attempted_at,
         }
 
-        retried_inventory_feed_id: str | None = None
-        if auto_request.confirm and pending_inventory_items:
-            pending_skus = [item.sku for item in pending_inventory_items]
-            try:
-                pending_submission = await walmart_client.submit_inventory_feed(
-                    build_inventory_feed(pending_inventory_items)
-                )
-            except WalmartApiError as exc:
-                repository.update_walmart_draft_publish_state(
-                    pending_skus,
-                    "offer_submitted_inventory_pending",
-                    error_message=str(exc),
-                )
-            else:
-                retried_inventory_feed_id = str(pending_submission["feed_id"])
-                repository.update_walmart_draft_publish_state(
-                    pending_skus,
-                    "submitted",
-                    inventory_feed_id=retried_inventory_feed_id,
-                )
-                base_result["retried_inventory_skus"] = pending_skus
-                base_result["retried_inventory_feed_id"] = retried_inventory_feed_id
-                base_result["awaiting_walmart"] = [
-                    sku for sku in awaiting_walmart if sku not in set(pending_skus)
-                ]
-
         if not auto_request.confirm or not ready_skus:
-            if retried_inventory_feed_id:
-                base_result["status"] = "inventory_retry_submitted"
             walmart_auto_publish_status = base_result
             return base_result
 
@@ -1190,9 +1373,50 @@ async def _run_walmart_auto_publish_once(
             "offer_submitted_inventory_pending",
             offer_feed_id=offer_feed_id,
         )
+        try:
+            offer_feed = await _wait_for_walmart_feed(offer_feed_id)
+        except WalmartApiError as exc:
+            walmart_auto_publish_status = {
+                **base_result,
+                "status": "offer_submitted_inventory_pending",
+                "offer_feed_id": offer_feed_id,
+                "message": str(exc),
+            }
+            return walmart_auto_publish_status
+
+        if str(offer_feed.get("feedStatus") or "").upper() != "PROCESSED":
+            repository.update_walmart_draft_publish_state(
+                ready_skus,
+                "processing",
+                offer_feed_id=offer_feed_id,
+            )
+            walmart_auto_publish_status = {
+                **base_result,
+                "status": "processing",
+                "offer_feed_id": offer_feed_id,
+                "message": "The Walmart offer feed is still processing; inventory was not sent yet.",
+            }
+            return walmart_auto_publish_status
+
+        offer_states = _apply_walmart_offer_feed_results(offer_feed, ready_set)
+        accepted_offer_skus = [
+            sku
+            for sku in ready_skus
+            if offer_states.get(sku) == "offer_processed_inventory_pending"
+        ]
+        if not accepted_offer_skus:
+            walmart_auto_publish_status = {
+                **base_result,
+                "status": "offer_processed_no_success",
+                "offer_feed_id": offer_feed_id,
+                "offer_states": offer_states,
+                "message": "Walmart did not accept any offer, so no inventory feed was sent.",
+            }
+            return walmart_auto_publish_status
+
         ready_items = repository.ebay_items(
-            ready_skus,
-            limit=len(ready_skus),
+            accepted_offer_skus,
+            limit=len(accepted_offer_skus),
             include_inactive=False,
         )
         try:
@@ -1201,8 +1425,8 @@ async def _run_walmart_auto_publish_once(
             )
         except WalmartApiError as exc:
             repository.update_walmart_draft_publish_state(
-                ready_skus,
-                "offer_submitted_inventory_pending",
+                accepted_offer_skus,
+                "offer_processed_inventory_pending",
                 offer_feed_id=offer_feed_id,
                 error_message=str(exc),
             )
@@ -1216,28 +1440,57 @@ async def _run_walmart_auto_publish_once(
 
         inventory_feed_id = str(inventory_submission["feed_id"])
         repository.update_walmart_draft_publish_state(
-            ready_skus,
-            "submitted",
+            accepted_offer_skus,
+            "offer_processed_inventory_pending",
             offer_feed_id=offer_feed_id,
             inventory_feed_id=inventory_feed_id,
         )
+        try:
+            inventory_feed = await _wait_for_walmart_feed(inventory_feed_id)
+        except WalmartApiError as exc:
+            walmart_auto_publish_status = {
+                **base_result,
+                "status": "offer_processed_inventory_pending",
+                "offer_feed_id": offer_feed_id,
+                "inventory_feed_id": inventory_feed_id,
+                "offer_states": offer_states,
+                "message": str(exc),
+            }
+            return walmart_auto_publish_status
+
+        inventory_states = _apply_walmart_inventory_feed_results(
+            inventory_feed,
+            set(accepted_offer_skus),
+        )
+        submitted_skus = [
+            sku for sku in accepted_offer_skus if inventory_states.get(sku) == "submitted"
+        ]
+        pending_inventory_skus = [
+            sku for sku in accepted_offer_skus if inventory_states.get(sku) != "submitted"
+        ]
+        final_status = "submitted" if len(submitted_skus) == len(ready_skus) else "processed_with_errors"
         walmart_auto_publish_status = {
             **base_result,
-            "status": "submitted",
-            "submitted_items": len(ready_skus),
-            "submitted_skus": ready_skus,
+            "status": final_status,
+            "submitted_items": len(submitted_skus),
+            "submitted_skus": submitted_skus,
+            "pending_inventory_skus": pending_inventory_skus,
             "offer_feed_id": offer_feed_id,
             "inventory_feed_id": inventory_feed_id,
-            "message": "Walmart offer and current eBay inventory feeds were submitted.",
+            "offer_states": offer_states,
+            "inventory_states": inventory_states,
+            "message": (
+                "Walmart inventory was sent only for offers that its feed processor accepted."
+            ),
         }
         walmart_sync_status = {
-            "status": "auto_publish_submitted",
+            "status": f"auto_publish_{final_status}",
             "configured": True,
             "last_submission": {
                 "offer_feed_id": offer_feed_id,
                 "inventory_feed_id": inventory_feed_id,
             },
-            "submitted_items": len(ready_skus),
+            "submitted_items": len(submitted_skus),
             "last_attempt_at": attempted_at,
         }
         return walmart_auto_publish_status
@@ -1965,6 +2218,18 @@ async def run_walmart_auto_publish(
 ) -> dict[str, Any]:
     verify_secret(x_horizon_secret, request.query_params.get("secret"))
     return await _run_walmart_auto_publish_once(auto_request)
+
+
+@app.post("/walmart/auto-publish/reconcile")
+async def reconcile_walmart_auto_publish(
+    request: Request,
+    confirm: bool = False,
+    x_horizon_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_secret(x_horizon_secret, request.query_params.get("secret"))
+    return await _reconcile_walmart_auto_publish_feeds(
+        confirm_inventory_actions=confirm
+    )
 
 
 @app.post("/walmart/import/preview")

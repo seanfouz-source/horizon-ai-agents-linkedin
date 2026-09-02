@@ -3,6 +3,11 @@ import asyncio
 import app.main as main_module
 from app.inventory import InventoryRepository
 from app.models import InventoryItem, WalmartAutoPublishRequest
+from app.walmart_feed_reconciliation import (
+    classify_walmart_inventory_result,
+    classify_walmart_offer_result,
+    walmart_feed_item_results,
+)
 
 
 class FakeWalmartClient:
@@ -25,6 +30,18 @@ class FakeWalmartClient:
     async def submit_inventory_feed(self, payload):
         self.inventory_payloads.append(payload)
         return {"status": "submitted", "feed_id": "INVENTORY-AUTO"}
+
+    async def get_feed_status(self, feed_id, *, include_details=True):
+        sku = "EBAY-AUTO-1"
+        return {
+            "feedId": feed_id,
+            "feedStatus": "PROCESSED",
+            "itemDetails": {
+                "itemIngestionStatus": [
+                    {"sku": sku, "ingestionStatus": "SUCCESS", "ingestionErrors": {}}
+                ]
+            },
+        }
 
 
 def test_auto_publish_previews_submits_current_inventory_and_does_not_repeat(
@@ -117,3 +134,58 @@ def test_auto_publish_excludes_user_blocked_products(monkeypatch):
     assert main_module._walmart_auto_publish_exclusion(
         InventoryItem(sku="CASE", title="OtterBox Defender case")
     ) == "otterbox"
+
+
+def test_feed_reconciliation_classifies_live_walmart_failure_modes():
+    payload = {
+        "itemDetails": {
+            "itemIngestionStatus": [
+                {
+                    "sku": "CONFLICT",
+                    "ingestionStatus": "DATA_ERROR",
+                    "ingestionErrors": {
+                        "ingestionError": [
+                            {
+                                "code": "ERR_EXT_DATA_0101211",
+                                "description": "This SKU is already set up with a different Product ID.",
+                            }
+                        ]
+                    },
+                },
+                {
+                    "sku": "REVIEW",
+                    "ingestionStatus": "DATA_ERROR",
+                    "ingestionErrors": {
+                        "ingestionError": {
+                            "description": "This item is currently under compliance review.",
+                        }
+                    },
+                },
+                {
+                    "sku": "RETRY",
+                    "ingestionStatus": "SYSTEM_ERROR",
+                    "ingestionErrors": {},
+                },
+            ]
+        }
+    }
+
+    results = walmart_feed_item_results(payload)
+
+    assert classify_walmart_offer_result(results["CONFLICT"]) == "blocked_product_id_conflict"
+    assert classify_walmart_offer_result(results["REVIEW"]) == "compliance_review"
+    assert classify_walmart_offer_result(results["RETRY"]) == "retryable_offer_error"
+
+
+def test_inventory_not_found_remains_pending_for_a_safe_retry():
+    result = {
+        "status": "DATA_ERROR",
+        "errors": [
+            {
+                "code": "EXT_DATA_ERROR_54055672686268",
+                "description": "The system did not find an item with the SKU information provided.",
+            }
+        ],
+    }
+
+    assert classify_walmart_inventory_result(result) == "offer_processed_inventory_pending"
