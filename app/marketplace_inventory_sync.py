@@ -20,6 +20,7 @@ from app.walmart import (
 
 WALMART_FEED_GRACE_SECONDS = 10 * 60
 EBAY_FULL_IMAGE_SCAN_SECONDS = 60 * 60
+QUANTITY_POLICY_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,20 @@ def choose_inventory_sync_plan(
         return InventorySyncPlan(
             target_quantity=ebay_quantity,
             source="ebay_initial",
+            update_ebay=False,
+            update_walmart=walmart_quantity != ebay_quantity,
+        )
+
+    try:
+        policy_version = int(state.get("quantity_policy_version") or 1)
+    except (TypeError, ValueError):
+        policy_version = 1
+    if policy_version < QUANTITY_POLICY_VERSION:
+        # Establish today's eBay quantities as the safe cutover baseline. This
+        # prevents an old Walmart discrepancy from being misread as a new sale.
+        return InventorySyncPlan(
+            target_quantity=ebay_quantity,
+            source="ebay_policy_baseline",
             update_ebay=False,
             update_walmart=walmart_quantity != ebay_quantity,
         )
@@ -793,6 +808,7 @@ class MarketplaceInventorySyncer:
                 ],
                 pending_walmart_image_at=image_fields["pending_walmart_image_at"],
                 last_image_feed_id=image_fields["last_image_feed_id"],
+                quantity_policy_version=QUANTITY_POLICY_VERSION,
                 last_source=plan.source,
                 status="error" if sku_errors else ("pending" if is_pending else "synced"),
                 error_message=" ".join(sku_errors) or None,

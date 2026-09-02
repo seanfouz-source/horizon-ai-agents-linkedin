@@ -153,6 +153,7 @@ CREATE TABLE IF NOT EXISTS marketplace_inventory_sync_state (
     pending_walmart_image_signature TEXT,
     pending_walmart_image_at TEXT,
     last_image_feed_id TEXT,
+    quantity_policy_version INTEGER NOT NULL DEFAULT 1,
     last_source TEXT NOT NULL,
     status TEXT NOT NULL,
     error_message TEXT,
@@ -234,6 +235,11 @@ class InventoryRepository:
         if "price_currency" not in columns:
             connection.execute(
                 "ALTER TABLE marketplace_inventory_sync_state ADD COLUMN price_currency TEXT"
+            )
+        if "quantity_policy_version" not in columns:
+            connection.execute(
+                "ALTER TABLE marketplace_inventory_sync_state "
+                "ADD COLUMN quantity_policy_version INTEGER NOT NULL DEFAULT 1"
             )
 
     def _ensure_walmart_draft_columns(self, connection: sqlite3.Connection) -> None:
@@ -857,6 +863,7 @@ class InventoryRepository:
         pending_walmart_image_signature: str | None = None,
         pending_walmart_image_at: str | None = None,
         last_image_feed_id: str | None = None,
+        quantity_policy_version: int = 2,
         last_source: str,
         status: str,
         error_message: str | None = None,
@@ -872,10 +879,10 @@ class InventoryRepository:
                     ebay_image_signature, ebay_primary_image_url,
                     last_ebay_image_scan_at, synced_image_signature,
                     pending_walmart_image_signature, pending_walmart_image_at,
-                    last_image_feed_id,
+                    last_image_feed_id, quantity_policy_version,
                     last_source, status, error_message, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sku) DO UPDATE SET
                     ebay_item_id = excluded.ebay_item_id,
                     ebay_quantity = excluded.ebay_quantity,
@@ -893,6 +900,7 @@ class InventoryRepository:
                     pending_walmart_image_signature = excluded.pending_walmart_image_signature,
                     pending_walmart_image_at = excluded.pending_walmart_image_at,
                     last_image_feed_id = excluded.last_image_feed_id,
+                    quantity_policy_version = excluded.quantity_policy_version,
                     last_source = excluded.last_source,
                     status = excluded.status,
                     error_message = excluded.error_message,
@@ -924,6 +932,7 @@ class InventoryRepository:
                     pending_walmart_image_signature,
                     pending_walmart_image_at,
                     last_image_feed_id,
+                    max(1, int(quantity_policy_version)),
                     str(last_source),
                     str(status),
                     error_message,

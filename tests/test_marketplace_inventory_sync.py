@@ -16,6 +16,7 @@ def _state(quantity: int, **overrides):
         "synced_quantity": quantity,
         "pending_walmart_quantity": None,
         "pending_walmart_at": None,
+        "quantity_policy_version": 2,
     }
     state.update(overrides)
     return state
@@ -26,6 +27,24 @@ def test_first_sync_treats_ebay_as_source_of_truth():
 
     assert plan.target_quantity == 5
     assert plan.source == "ebay_initial"
+    assert plan.update_ebay is False
+    assert plan.update_walmart is True
+
+
+def test_policy_upgrade_baselines_from_ebay_without_altering_it():
+    plan = choose_inventory_sync_plan(
+        8,
+        3,
+        {
+            "synced_quantity": 5,
+            "pending_walmart_quantity": None,
+            "pending_walmart_at": None,
+            "quantity_policy_version": 1,
+        },
+    )
+
+    assert plan.target_quantity == 8
+    assert plan.source == "ebay_policy_baseline"
     assert plan.update_ebay is False
     assert plan.update_walmart is True
 
@@ -152,6 +171,7 @@ def test_inventory_sync_state_is_persistent(tmp_path):
     assert stored["price_currency"] == "USD"
     assert stored["pending_walmart_image_signature"] == "new-images"
     assert stored["last_image_feed_id"] == "IMAGE@123"
+    assert stored["quantity_policy_version"] == 2
     assert repository.marketplace_inventory_sync_summary()["by_status"] == {"pending": 1}
     assert repository.marketplace_inventory_sync_summary()["pending_quantity"] == 1
     assert repository.marketplace_inventory_sync_summary()["pending_images"] == 1
