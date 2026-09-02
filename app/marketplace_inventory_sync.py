@@ -18,6 +18,7 @@ from app.walmart import (
 
 
 WALMART_FEED_GRACE_SECONDS = 10 * 60
+EBAY_FULL_IMAGE_SCAN_SECONDS = 60 * 60
 
 
 @dataclass(frozen=True)
@@ -157,6 +158,7 @@ class MarketplaceInventorySyncer:
                 "item_id": str(row.get("item_id") or ""),
                 "quantity": max(0, int(row.get("quantity") or 0)),
                 "image_urls": _normalized_image_urls(row.get("image_urls")),
+                "image_complete": bool(row.get("image_complete")),
                 **(
                     {"inventory_tracking": row["inventory_tracking"]}
                     if row.get("inventory_tracking")
@@ -325,6 +327,12 @@ class MarketplaceInventorySyncer:
         image_states = {
             sku: {
                 "ebay_image_signature": (states[sku] or {}).get("ebay_image_signature"),
+                "ebay_primary_image_url": (states[sku] or {}).get(
+                    "ebay_primary_image_url"
+                ),
+                "last_ebay_image_scan_at": (states[sku] or {}).get(
+                    "last_ebay_image_scan_at"
+                ),
                 "synced_image_signature": (states[sku] or {}).get("synced_image_signature"),
                 "pending_walmart_image_signature": (states[sku] or {}).get(
                     "pending_walmart_image_signature"
@@ -338,6 +346,72 @@ class MarketplaceInventorySyncer:
         }
         image_errors: dict[str, str] = {}
         image_updates_confirmed = 0
+
+        image_refresh_item_ids: set[str] = set()
+        for sku in common_skus:
+            if sku not in image_states or sku not in plans:
+                continue
+            source_row = ebay_by_sku[sku]
+            images = source_row["image_urls"]
+            if not images:
+                continue
+            fields = image_states[sku]
+            current_primary = images[0]
+            draft_images = _draft_image_urls(draft_by_sku.get(sku))
+            previous_primary = str(fields["ebay_primary_image_url"] or "")
+            if not previous_primary and draft_images:
+                previous_primary = draft_images[0]
+            last_scan = _parse_datetime(fields["last_ebay_image_scan_at"])
+            scan_is_stale = (
+                last_scan is None
+                or (attempted_at - last_scan).total_seconds()
+                >= EBAY_FULL_IMAGE_SCAN_SECONDS
+            )
+            main_image_changed = bool(
+                previous_primary and current_primary != previous_primary
+            )
+            fields["ebay_primary_image_url"] = current_primary
+            if source_row["image_complete"]:
+                fields["last_ebay_image_scan_at"] = now_iso
+            elif source_row["item_id"] and (main_image_changed or scan_is_stale):
+                image_refresh_item_ids.add(source_row["item_id"])
+
+        refreshed_image_rows: list[dict[str, Any]] = []
+        if image_refresh_item_ids:
+            try:
+                refreshed_image_rows = await self.ebay_client.fetch_trading_listing_images(
+                    sorted(image_refresh_item_ids)
+                )
+            except Exception as exc:
+                for sku in common_skus:
+                    if ebay_by_sku[sku]["item_id"] in image_refresh_item_ids:
+                        image_errors[sku] = f"eBay full image refresh failed: {exc}"
+        refreshed_by_sku = {
+            str(row.get("sku") or "").strip(): row
+            for row in refreshed_image_rows
+            if str(row.get("sku") or "").strip()
+        }
+        for sku in common_skus:
+            if sku not in image_states or sku not in plans:
+                continue
+            item_id = ebay_by_sku[sku]["item_id"]
+            if item_id not in image_refresh_item_ids:
+                continue
+            refreshed = refreshed_by_sku.get(sku)
+            full_images = _normalized_image_urls(
+                refreshed.get("image_urls") if refreshed else None
+            )
+            if not full_images:
+                image_errors.setdefault(
+                    sku,
+                    "eBay did not return the full image set for this active listing.",
+                )
+                continue
+            ebay_by_sku[sku]["image_urls"] = full_images
+            ebay_by_sku[sku]["image_complete"] = True
+            image_states[sku]["ebay_primary_image_url"] = full_images[0]
+            image_states[sku]["last_ebay_image_scan_at"] = now_iso
+
         pending_feed_ids = {
             str(image_states[sku]["last_image_feed_id"])
             for sku in common_skus
@@ -367,9 +441,20 @@ class MarketplaceInventorySyncer:
             images = ebay_by_sku[sku]["image_urls"]
             if not images:
                 continue
-            current_signature = _image_signature(images)
             fields = image_states[sku]
-            fields["ebay_image_signature"] = current_signature
+            images_are_complete = bool(ebay_by_sku[sku]["image_complete"])
+            if images_are_complete:
+                current_signature = _image_signature(images)
+                fields["ebay_image_signature"] = current_signature
+            else:
+                current_signature = str(
+                    fields["ebay_image_signature"]
+                    or fields["pending_walmart_image_signature"]
+                    or fields["synced_image_signature"]
+                    or ""
+                )
+                if not current_signature:
+                    continue
             synced_signature = str(fields["synced_image_signature"] or "")
             if not synced_signature:
                 synced_signature = _draft_image_signature(draft_by_sku.get(sku))
@@ -423,6 +508,7 @@ class MarketplaceInventorySyncer:
 
             if (
                 current_signature != synced_signature
+                and images_are_complete
                 and not blocked_by_pending_feed
                 and sku not in image_errors
                 and not fields["pending_walmart_image_signature"]
@@ -564,6 +650,8 @@ class MarketplaceInventorySyncer:
                 pending_walmart_quantity=pending_quantity,
                 pending_walmart_at=pending_at,
                 ebay_image_signature=image_fields["ebay_image_signature"],
+                ebay_primary_image_url=image_fields["ebay_primary_image_url"],
+                last_ebay_image_scan_at=image_fields["last_ebay_image_scan_at"],
                 synced_image_signature=image_fields["synced_image_signature"],
                 pending_walmart_image_signature=image_fields[
                     "pending_walmart_image_signature"
@@ -620,13 +708,17 @@ def _image_signature(urls: list[str]) -> str:
 
 
 def _draft_image_signature(draft: dict[str, Any] | None) -> str:
+    images = _draft_image_urls(draft)
+    return _image_signature(images) if images else ""
+
+
+def _draft_image_urls(draft: dict[str, Any] | None) -> list[str]:
     if not draft:
-        return ""
+        return []
     prepared = draft.get("prepared_listing")
     if not isinstance(prepared, dict):
-        return ""
-    images = _normalized_image_urls(prepared.get("images"))
-    return _image_signature(images) if images else ""
+        return []
+    return _normalized_image_urls(prepared.get("images"))
 
 
 def _walmart_feed_outcome(payload: dict[str, Any]) -> str:

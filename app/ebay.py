@@ -957,6 +957,42 @@ class EbayClient:
                 snapshots.append(self._parse_trading_listing_snapshot(response.content))
         return snapshots
 
+    async def fetch_trading_listing_images(
+        self,
+        item_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        """Fetch complete current image sets for selected active Trading listings."""
+        selected_ids = self._dedupe_urls([str(value) for value in item_ids])
+        if not selected_ids:
+            return []
+        semaphore = asyncio.Semaphore(6)
+        rows: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=45) as client:
+            await self._ensure_access_token(client)
+
+            async def fetch_one(item_id: str) -> list[dict[str, Any]]:
+                try:
+                    async with semaphore:
+                        response = await self._post_content(
+                            client,
+                            "/ws/api.dll",
+                            content=self._trading_get_item_request(item_id),
+                            headers=self._trading_headers("GetItem"),
+                        )
+                    response.raise_for_status()
+                    return self._parse_trading_listing_images(response.content)
+                except (httpx.HTTPError, ET.ParseError, ValueError) as exc:
+                    logger.warning(
+                        "Could not refresh eBay listing images for %s: %s",
+                        item_id,
+                        exc,
+                    )
+                    return []
+
+            for result in await asyncio.gather(*(fetch_one(item_id) for item_id in selected_ids)):
+                rows.extend(result)
+        return rows
+
     async def fetch_active_inventory_quantities(self, *, limit: int = 200) -> list[dict[str, Any]]:
         """Fetch active seller SKU quantities in one lightweight Trading API call."""
         request_payload = self._trading_active_inventory_request(limit=limit)
@@ -1215,11 +1251,11 @@ class EbayClient:
             item_id = cls._xml_text(item, "ItemID") or ""
             variations = cls._xml_nested_child(item, "Variations")
             variation_rows = cls._xml_children(variations, "Variation")
+            picture_details = cls._xml_child(item, "PictureDetails")
+            parent_picture_urls = cls._xml_child_texts(picture_details, "PictureURL")
+            gallery_url = cls._xml_text(picture_details, "GalleryURL")
             parent_images = cls._dedupe_urls(
-                cls._xml_child_texts(
-                    cls._xml_child(item, "PictureDetails"),
-                    "PictureURL",
-                )
+                parent_picture_urls + ([gallery_url] if gallery_url else [])
             )
             if variation_rows:
                 picture_map = cls._xml_variation_picture_map(variations)
@@ -1248,6 +1284,10 @@ class EbayClient:
                     )
                     if image_urls:
                         row["image_urls"] = image_urls
+                        row["image_complete"] = bool(
+                            parent_picture_urls
+                            or cls._variation_images(variation_specifics, picture_map)
+                        )
                     if not seller_sku:
                         price_node = cls._xml_child(variation, "StartPrice")
                         price = cls._float_value(
@@ -1278,10 +1318,62 @@ class EbayClient:
             row = {"sku": sku, "item_id": item_id, "quantity": max(0, total - sold)}
             if parent_images:
                 row["image_urls"] = parent_images
+                row["image_complete"] = bool(parent_picture_urls)
             if not seller_sku:
                 row["inventory_tracking"] = "item_id"
             rows.append(row)
         return rows
+
+    @classmethod
+    def _parse_trading_listing_images(cls, payload: bytes | str) -> list[dict[str, Any]]:
+        root = ET.fromstring(payload)
+        ack = cls._xml_text(root, "Ack") or "Failure"
+        if ack not in {"Success", "Warning"}:
+            messages = [
+                cls._xml_text(error, "LongMessage") or cls._xml_text(error, "ShortMessage")
+                for error in cls._xml_children(root, "Errors")
+            ]
+            raise ValueError("; ".join(message for message in messages if message) or ack)
+        item = cls._xml_child(root, "Item")
+        if item is None:
+            raise ValueError("eBay Trading API response did not include an Item.")
+
+        item_id = cls._xml_text(item, "ItemID") or ""
+        picture_details = cls._xml_child(item, "PictureDetails")
+        gallery_url = cls._xml_text(picture_details, "GalleryURL")
+        parent_images = cls._dedupe_urls(
+            cls._xml_child_texts(picture_details, "PictureURL")
+            + ([gallery_url] if gallery_url else [])
+        )
+        variations = cls._xml_child(item, "Variations")
+        variation_rows = cls._xml_children(variations, "Variation")
+        if variation_rows:
+            picture_map = cls._xml_variation_picture_map(variations)
+            rows: list[dict[str, Any]] = []
+            for index, variation in enumerate(variation_rows, start=1):
+                specifics = cls._xml_name_values(
+                    cls._xml_child(variation, "VariationSpecifics")
+                )
+                sku = cls._xml_text(variation, "SKU") or cls._generated_variation_sku(
+                    item_id,
+                    specifics,
+                    index,
+                )
+                images = cls._dedupe_urls(
+                    cls._variation_images(specifics, picture_map) + parent_images
+                )
+                if sku and images:
+                    rows.append(
+                        {"sku": sku, "item_id": item_id, "image_urls": images}
+                    )
+            return rows
+
+        sku = cls._xml_text(item, "SKU") or (f"EBAY-{item_id}" if item_id else "")
+        return (
+            [{"sku": sku, "item_id": item_id, "image_urls": parent_images}]
+            if sku and parent_images
+            else []
+        )
 
     @staticmethod
     def _trading_revise_inventory_request(updates: list[dict[str, Any]]) -> bytes:

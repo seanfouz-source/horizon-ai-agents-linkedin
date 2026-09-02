@@ -120,6 +120,8 @@ CREATE TABLE IF NOT EXISTS marketplace_inventory_sync_state (
     pending_walmart_quantity INTEGER,
     pending_walmart_at TEXT,
     ebay_image_signature TEXT,
+    ebay_primary_image_url TEXT,
+    last_ebay_image_scan_at TEXT,
     synced_image_signature TEXT,
     pending_walmart_image_signature TEXT,
     pending_walmart_image_at TEXT,
@@ -185,6 +187,8 @@ class InventoryRepository:
         }
         for name in (
             "ebay_image_signature",
+            "ebay_primary_image_url",
+            "last_ebay_image_scan_at",
             "synced_image_signature",
             "pending_walmart_image_signature",
             "pending_walmart_image_at",
@@ -649,6 +653,8 @@ class InventoryRepository:
         pending_walmart_quantity: int | None = None,
         pending_walmart_at: str | None = None,
         ebay_image_signature: str | None = None,
+        ebay_primary_image_url: str | None = None,
+        last_ebay_image_scan_at: str | None = None,
         synced_image_signature: str | None = None,
         pending_walmart_image_signature: str | None = None,
         pending_walmart_image_at: str | None = None,
@@ -664,12 +670,13 @@ class InventoryRepository:
                 INSERT INTO marketplace_inventory_sync_state (
                     sku, ebay_item_id, ebay_quantity, walmart_quantity,
                     synced_quantity, pending_walmart_quantity, pending_walmart_at,
-                    ebay_image_signature, synced_image_signature,
+                    ebay_image_signature, ebay_primary_image_url,
+                    last_ebay_image_scan_at, synced_image_signature,
                     pending_walmart_image_signature, pending_walmart_image_at,
                     last_image_feed_id,
                     last_source, status, error_message, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sku) DO UPDATE SET
                     ebay_item_id = excluded.ebay_item_id,
                     ebay_quantity = excluded.ebay_quantity,
@@ -678,6 +685,8 @@ class InventoryRepository:
                     pending_walmart_quantity = excluded.pending_walmart_quantity,
                     pending_walmart_at = excluded.pending_walmart_at,
                     ebay_image_signature = excluded.ebay_image_signature,
+                    ebay_primary_image_url = excluded.ebay_primary_image_url,
+                    last_ebay_image_scan_at = excluded.last_ebay_image_scan_at,
                     synced_image_signature = excluded.synced_image_signature,
                     pending_walmart_image_signature = excluded.pending_walmart_image_signature,
                     pending_walmart_image_at = excluded.pending_walmart_image_at,
@@ -700,6 +709,8 @@ class InventoryRepository:
                     ),
                     pending_walmart_at,
                     ebay_image_signature,
+                    ebay_primary_image_url,
+                    last_ebay_image_scan_at,
                     synced_image_signature,
                     pending_walmart_image_signature,
                     pending_walmart_image_at,

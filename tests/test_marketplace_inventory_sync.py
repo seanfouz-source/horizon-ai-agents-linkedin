@@ -126,6 +126,7 @@ class FakeEbayClient:
             }
         ]
         self.revisions = []
+        self.image_refreshes = []
 
     async def fetch_active_inventory_quantities(self, *, limit):
         assert limit == 200
@@ -134,6 +135,18 @@ class FakeEbayClient:
     async def revise_inventory_quantities(self, updates):
         self.revisions.extend(updates)
         return [{**update, "status": "updated"} for update in updates]
+
+    async def fetch_trading_listing_images(self, item_ids):
+        self.image_refreshes.append(item_ids)
+        return [
+            {
+                "sku": row["sku"],
+                "item_id": row["item_id"],
+                "image_urls": row["image_urls"],
+            }
+            for row in self.rows
+            if row["item_id"] in item_ids
+        ]
 
 
 class FakeWalmartClient:
@@ -224,6 +237,7 @@ def test_syncer_updates_changed_images_and_zeroes_ended_listing(tmp_path):
 
     assert first["zeroed_walmart"] == 1
     assert first["image_updates_submitted"] == 1
+    assert ebay.image_refreshes == [["100"]]
     inventory_rows = walmart.inventory_payloads[0]["Inventory"]
     assert inventory_rows == [
         {

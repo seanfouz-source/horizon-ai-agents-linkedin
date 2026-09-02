@@ -388,6 +388,27 @@ def test_ebay_lightweight_inventory_parser_includes_current_images():
         "https://i.ebayimg.com/images/g/black/s-l1600.jpg",
         "https://i.ebayimg.com/images/g/base/s-l1600.jpg",
     ]
+    assert rows[0]["image_complete"] is True
+
+
+def test_ebay_lightweight_inventory_parser_uses_gallery_image_fallback():
+    payload = b"""<?xml version="1.0" encoding="utf-8"?>
+    <GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+      <Ack>Success</Ack>
+      <ActiveList><ItemArray><Item>
+        <ItemID>123</ItemID><SKU>PHONE-1</SKU><Quantity>1</Quantity>
+        <PictureDetails>
+          <GalleryURL>https://i.ebayimg.com/images/g/gallery/s-l1600.jpg</GalleryURL>
+        </PictureDetails>
+      </Item></ItemArray></ActiveList>
+    </GetMyeBaySellingResponse>"""
+
+    rows = EbayClient._parse_trading_active_inventory(payload)
+
+    assert rows[0]["image_urls"] == [
+        "https://i.ebayimg.com/images/g/gallery/s-l1600.jpg"
+    ]
+    assert rows[0]["image_complete"] is False
 
 
 def test_ebay_lightweight_inventory_parser_generates_missing_skus():
