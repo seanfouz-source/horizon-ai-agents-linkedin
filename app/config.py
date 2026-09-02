@@ -66,8 +66,11 @@ class Settings(BaseSettings):
     walmart_market: str = "us"
     walmart_channel_type: str | None = None
     walmart_default_shipping_weight_lbs: float | None = None
+    walmart_price_markup_percent: float = 10.0
     walmart_stage_drafts_on_startup: bool = True
     walmart_unpublished_batch_id: str | None = None
+    marketplace_inventory_sync_enabled: bool = False
+    marketplace_inventory_sync_interval_seconds: int = 60
     seed_inventory_csv: Path | None = BASE_DIR / "data" / "exactspec_public_store.csv"
     public_base_url: str = "https://horizon-ai-agents.onrender.com"
     database_path: Path = BASE_DIR / "data" / "horizon_agents.db"

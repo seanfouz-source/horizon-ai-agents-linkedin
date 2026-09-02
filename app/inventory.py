@@ -111,6 +111,22 @@ CREATE TABLE IF NOT EXISTS walmart_unpublished_jobs (
 CREATE INDEX IF NOT EXISTS idx_walmart_unpublished_jobs_status
 ON walmart_unpublished_jobs(status);
 
+CREATE TABLE IF NOT EXISTS marketplace_inventory_sync_state (
+    sku TEXT PRIMARY KEY,
+    ebay_item_id TEXT,
+    ebay_quantity INTEGER NOT NULL,
+    walmart_quantity INTEGER NOT NULL,
+    synced_quantity INTEGER NOT NULL,
+    pending_walmart_quantity INTEGER,
+    pending_walmart_at TEXT,
+    last_source TEXT NOT NULL,
+    status TEXT NOT NULL,
+    error_message TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_marketplace_inventory_sync_status
+ON marketplace_inventory_sync_state(status);
+
 CREATE TABLE IF NOT EXISTS ebay_seller_hub_draft_jobs (
     batch_id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
@@ -572,6 +588,108 @@ class InventoryRepository:
                 """
             ).fetchone()
         return self._walmart_job_from_row(row) if row else None
+
+    def update_inventory_quantity(self, sku: str, quantity: int) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE inventory_items
+                SET quantity = ?, updated_at = ?
+                WHERE sku = ?
+                """,
+                (
+                    max(0, int(quantity)),
+                    datetime.now(timezone.utc).isoformat(),
+                    str(sku),
+                ),
+            )
+        return bool(cursor.rowcount)
+
+    def marketplace_inventory_sync_state(self, sku: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM marketplace_inventory_sync_state WHERE sku = ?",
+                (str(sku),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_marketplace_inventory_sync_state(
+        self,
+        *,
+        sku: str,
+        ebay_item_id: str | None,
+        ebay_quantity: int,
+        walmart_quantity: int,
+        synced_quantity: int,
+        pending_walmart_quantity: int | None = None,
+        pending_walmart_at: str | None = None,
+        last_source: str,
+        status: str,
+        error_message: str | None = None,
+    ) -> dict[str, Any]:
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO marketplace_inventory_sync_state (
+                    sku, ebay_item_id, ebay_quantity, walmart_quantity,
+                    synced_quantity, pending_walmart_quantity, pending_walmart_at,
+                    last_source, status, error_message, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sku) DO UPDATE SET
+                    ebay_item_id = excluded.ebay_item_id,
+                    ebay_quantity = excluded.ebay_quantity,
+                    walmart_quantity = excluded.walmart_quantity,
+                    synced_quantity = excluded.synced_quantity,
+                    pending_walmart_quantity = excluded.pending_walmart_quantity,
+                    pending_walmart_at = excluded.pending_walmart_at,
+                    last_source = excluded.last_source,
+                    status = excluded.status,
+                    error_message = excluded.error_message,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(sku),
+                    ebay_item_id,
+                    max(0, int(ebay_quantity)),
+                    max(0, int(walmart_quantity)),
+                    max(0, int(synced_quantity)),
+                    (
+                        max(0, int(pending_walmart_quantity))
+                        if pending_walmart_quantity is not None
+                        else None
+                    ),
+                    pending_walmart_at,
+                    str(last_source),
+                    str(status),
+                    error_message,
+                    now,
+                ),
+            )
+        return self.marketplace_inventory_sync_state(sku) or {}
+
+    def marketplace_inventory_sync_summary(self) -> dict[str, Any]:
+        with self.connect() as connection:
+            total = connection.execute(
+                "SELECT COUNT(*) AS total FROM marketplace_inventory_sync_state"
+            ).fetchone()
+            statuses = connection.execute(
+                """
+                SELECT status, COUNT(*) AS total
+                FROM marketplace_inventory_sync_state
+                GROUP BY status
+                ORDER BY status
+                """
+            ).fetchall()
+            latest = connection.execute(
+                "SELECT MAX(updated_at) AS latest_updated_at FROM marketplace_inventory_sync_state"
+            ).fetchone()
+        return {
+            "total": int(total["total"]),
+            "by_status": {str(row["status"]): int(row["total"]) for row in statuses},
+            "latest_updated_at": latest["latest_updated_at"],
+        }
 
     def upsert_ebay_seller_hub_draft_job(
         self,

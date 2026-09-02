@@ -4,6 +4,7 @@ import re
 import uuid
 from base64 import b64encode
 from datetime import date
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterable
 from urllib.parse import quote
 
@@ -189,6 +190,60 @@ class WalmartMarketplaceClient:
         )
         return self._json_object(response)
 
+    async def list_published_items(self, *, limit: int = 1000) -> list[dict[str, Any]]:
+        response = await self._request(
+            "GET",
+            "/v3/items",
+            params={
+                "publishedStatus": "PUBLISHED",
+                "lifecycleStatus": "ACTIVE",
+                "limit": max(1, min(limit, 1000)),
+            },
+        )
+        payload = self._json_object(response)
+        raw_items = payload.get("ItemResponse") or payload.get("items") or []
+        if isinstance(raw_items, dict):
+            raw_items = raw_items.get("Item") or raw_items.get("items") or []
+        if not isinstance(raw_items, list):
+            raw_items = []
+        return [
+            {
+                "sku": str(item.get("sku") or "").strip(),
+                "published_status": str(
+                    item.get("publishedStatus") or item.get("published_status") or ""
+                ).upper(),
+                "lifecycle_status": str(
+                    item.get("lifecycleStatus") or item.get("lifecycle_status") or ""
+                ).upper(),
+            }
+            for item in raw_items
+            if isinstance(item, dict) and str(item.get("sku") or "").strip()
+        ]
+
+    async def get_inventory_quantity(self, sku: str) -> int:
+        clean_sku = str(sku or "").strip()
+        if not clean_sku:
+            raise WalmartApiError("A Walmart seller SKU is required.")
+        response = await self._request(
+            "GET",
+            "/v3/inventory",
+            params={"sku": clean_sku},
+        )
+        payload = self._json_object(response)
+        quantity = payload.get("quantity")
+        if isinstance(quantity, dict):
+            quantity = quantity.get("amount")
+        if quantity is None and isinstance(payload.get("inventory"), dict):
+            quantity = payload["inventory"].get("quantity")
+            if isinstance(quantity, dict):
+                quantity = quantity.get("amount")
+        try:
+            return max(0, int(float(quantity)))
+        except (TypeError, ValueError) as exc:
+            raise WalmartApiError(
+                f"Walmart inventory response did not include a quantity for SKU {clean_sku}."
+            ) from exc
+
     async def _get_access_token(self, *, force: bool = False) -> str:
         if self._access_token and not force:
             return self._access_token
@@ -286,6 +341,7 @@ def build_offer_match_preview(
     overrides: dict[str, WalmartItemOverride] | None = None,
     *,
     default_shipping_weight_lbs: float | None = None,
+    price_markup_percent: float = 10.0,
 ) -> dict[str, Any]:
     item_overrides = overrides or {}
     ready_entries: list[dict[str, Any]] = []
@@ -297,6 +353,7 @@ def build_offer_match_preview(
             item,
             override,
             default_shipping_weight_lbs=default_shipping_weight_lbs,
+            price_markup_percent=price_markup_percent,
         )
         ready = not errors
         if entry is not None and ready:
@@ -375,6 +432,7 @@ def build_walmart_draft(
     catalog_result: dict[str, Any] | None = None,
     *,
     lookup_error: str | None = None,
+    price_markup_percent: float = 10.0,
 ) -> dict[str, Any]:
     specifics = {_normalize_key(key): str(value or "").strip() for key, value in item.item_specifics.items()}
     identifier_type, identifier = _product_identifier(item, WalmartItemOverride())
@@ -414,7 +472,9 @@ def build_walmart_draft(
         "category": item.category,
         "condition": mapped_condition,
         "source_condition": item.condition,
-        "price": item.price,
+        "price": walmart_price(item.price, price_markup_percent),
+        "source_price": item.price,
+        "price_markup_percent": price_markup_percent,
         "currency": item.currency,
         "quantity": item.quantity,
         "shipping_weight_lbs": shipping_weight_lbs,
@@ -522,6 +582,7 @@ def _build_offer_match_item(
     override: WalmartItemOverride,
     *,
     default_shipping_weight_lbs: float | None,
+    price_markup_percent: float,
 ) -> tuple[dict[str, Any] | None, list[str], list[str], dict[str, Any]]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -536,7 +597,11 @@ def _build_offer_match_item(
         if shipping_weight_lbs is not None:
             warnings.append("Used WALMART_DEFAULT_SHIPPING_WEIGHT_LBS; verify the packaged weight before submission.")
     condition = _walmart_condition(override.condition or item.condition)
-    price = override.price if override.price is not None else item.price
+    price = (
+        override.price
+        if override.price is not None
+        else walmart_price(item.price, price_markup_percent)
+    )
     quantity = override.quantity if override.quantity is not None else item.quantity
     main_image_url = override.main_image_url or item.image_url
 
@@ -636,6 +701,15 @@ def _parse_weight_lbs(value: object) -> float | None:
     elif unit == "g":
         amount *= 0.0022046226218
     return round(amount, 3) if amount > 0 else None
+
+
+def walmart_price(price: float | None, markup_percent: float = 10.0) -> float | None:
+    if price is None:
+        return None
+    multiplier = Decimal("1") + (Decimal(str(markup_percent)) / Decimal("100"))
+    return float(
+        (Decimal(str(price)) * multiplier).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    )
 
 
 def _walmart_condition(value: str | None) -> str | None:

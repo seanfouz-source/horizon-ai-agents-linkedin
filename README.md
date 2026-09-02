@@ -246,6 +246,22 @@ The generate request accepts `sync_ebay_first`, `search_walmart_catalog`,
 `max_items`, optional `skus`, and `catalog_candidates_per_item`. Publishing
 remains a separate operation behind the existing `confirm=true` guard.
 
+Walmart draft and offer prices are calculated from the current eBay price plus
+`WALMART_PRICE_MARKUP_PERCENT` (10% in production). The source price and markup
+percentage are retained with each staged draft for review, and all available
+eBay image URLs are kept in the draft record.
+
+Once an item is published on Walmart, the production service reconciles its
+quantity with the matching eBay seller SKU every 60 seconds. The first pass
+treats eBay as the source quantity; after that, a change on either marketplace
+flows to the other. If both quantities change between passes, the lower number
+wins to prevent overselling. Walmart drafts and unpublished items are excluded.
+The status endpoint is:
+
+```text
+GET /inventory/sync/marketplaces/status
+```
+
 For an explicitly authorized API-only batch that must be visible in Walmart
 without becoming buyable, set a unique `WALMART_UNPUBLISHED_BATCH_ID`. The
 startup worker submits only a single exact catalog match for each SKU and then

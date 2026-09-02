@@ -33,6 +33,7 @@ from app.ebay_draft_batch import (
 from app.integrations import extract_customer_message, manychat_dynamic_response, normalize_channel, zapier_social_drafts_response
 from app.inventory import InventoryRepository
 from app.inventory_seed import seed_inventory_if_empty
+from app.marketplace_inventory_sync import MarketplaceInventorySyncer
 from app.media import product_card_for_item, product_card_jpeg_for_item, tiktok_ebay_photo_jpeg_for_item
 from app.metricool import MetricoolPublishError, schedule_metricool_payloads
 from app.models import (
@@ -130,6 +131,13 @@ walmart_unpublished_status: dict[str, Any] = repository.latest_walmart_unpublish
     "status": "not_authorized",
     "message": "No one-time zero-inventory Walmart offer batch has been authorized.",
 }
+marketplace_inventory_sync_status: dict[str, Any] = {
+    "status": "not_run",
+    "enabled": settings.marketplace_inventory_sync_enabled,
+    "interval_seconds": settings.marketplace_inventory_sync_interval_seconds,
+    "last_attempt_at": None,
+}
+marketplace_inventory_sync_lock = asyncio.Lock()
 app = FastAPI(title=settings.app_name)
 logger = logging.getLogger(__name__)
 LISTING_PHOTO_DIRECTORY = Path(__file__).with_name("listing_photos")
@@ -170,6 +178,10 @@ def health() -> dict[str, Any]:
             "stored": repository.walmart_draft_summary(),
         },
         "walmart_unpublished": walmart_unpublished_status,
+        "marketplace_inventory_sync": {
+            **marketplace_inventory_sync_status,
+            "stored": repository.marketplace_inventory_sync_summary(),
+        },
     }
 
 
@@ -331,6 +343,8 @@ async def startup_inventory_sync() -> None:
     seed_inventory_if_empty(repository, settings.seed_inventory_csv)
     asyncio.create_task(_startup_inventory_refresh())
     asyncio.create_task(_startup_walmart_auth_check())
+    if settings.marketplace_inventory_sync_enabled:
+        asyncio.create_task(_marketplace_inventory_sync_loop())
 
 
 async def _startup_walmart_auth_check() -> None:
@@ -385,6 +399,46 @@ async def _startup_inventory_refresh() -> None:
         return
     if settings.sync_store_page_on_startup:
         await store_syncer.sync()
+
+
+async def _marketplace_inventory_sync_loop() -> None:
+    interval = max(30, int(settings.marketplace_inventory_sync_interval_seconds))
+    await asyncio.sleep(interval)
+    while True:
+        try:
+            await _run_marketplace_inventory_sync_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("Marketplace inventory sync failed: %s", exc)
+        await asyncio.sleep(interval)
+
+
+async def _run_marketplace_inventory_sync_once() -> dict[str, Any]:
+    global marketplace_inventory_sync_status
+    if marketplace_inventory_sync_lock.locked():
+        return {
+            **marketplace_inventory_sync_status,
+            "status": "already_running",
+        }
+    async with marketplace_inventory_sync_lock:
+        try:
+            syncer = MarketplaceInventorySyncer(
+                repository,
+                EbayClient(settings),
+                walmart_client,
+            )
+            marketplace_inventory_sync_status = await syncer.sync_once()
+        except Exception as exc:
+            marketplace_inventory_sync_status = {
+                "status": "error",
+                "enabled": settings.marketplace_inventory_sync_enabled,
+                "interval_seconds": settings.marketplace_inventory_sync_interval_seconds,
+                "message": str(exc),
+                "last_attempt_at": datetime.now(timezone.utc).isoformat(),
+            }
+            raise
+    return marketplace_inventory_sync_status
 
 
 async def _sync_ebay_api_inventory() -> dict[str, Any]:
@@ -559,6 +613,7 @@ async def _prepare_walmart_import(
         items,
         import_request.overrides,
         default_shipping_weight_lbs=settings.walmart_default_shipping_weight_lbs,
+        price_markup_percent=settings.walmart_price_markup_percent,
     )
     preview["ebay_sync"] = ebay_refresh
     preview["walmart_configured"] = walmart_client.configured
@@ -659,7 +714,12 @@ async def _generate_walmart_drafts(
                         "total_candidates": 0,
                         "candidates": [],
                     }
-        return build_walmart_draft(item, catalog_result, lookup_error=lookup_error)
+        return build_walmart_draft(
+            item,
+            catalog_result,
+            lookup_error=lookup_error,
+            price_markup_percent=settings.walmart_price_markup_percent,
+        )
 
     drafts = await asyncio.gather(*(stage_item(item) for item in items))
     stored = repository.upsert_walmart_drafts(drafts)
@@ -1544,6 +1604,36 @@ async def sync_walmart_inventory(
         "ebay_sync": ebay_refresh,
         "inventory": payload["Inventory"],
     }
+
+
+@app.get("/inventory/sync/marketplaces/status")
+def marketplace_inventory_status() -> dict[str, Any]:
+    return {
+        **marketplace_inventory_sync_status,
+        "enabled": settings.marketplace_inventory_sync_enabled,
+        "interval_seconds": max(30, int(settings.marketplace_inventory_sync_interval_seconds)),
+        "stored": repository.marketplace_inventory_sync_summary(),
+    }
+
+
+@app.post("/inventory/sync/marketplaces")
+async def sync_marketplace_inventory(
+    request: Request,
+    confirm: bool = False,
+    x_horizon_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_secret(x_horizon_secret, request.query_params.get("secret"))
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Set confirm=true to reconcile live eBay and published Walmart quantities.",
+        )
+    if not walmart_client.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="WALMART_CLIENT_ID and WALMART_CLIENT_SECRET are not configured.",
+        )
+    return await _run_marketplace_inventory_sync_once()
 
 
 @app.post("/agent/customer-answer", response_model=dict[str, Any])

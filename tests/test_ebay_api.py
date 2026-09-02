@@ -41,8 +41,8 @@ class FakeAsyncClient:
     async def get(self, path, params=None, headers=None):
         return self._call_handler(path, params or {}, headers or {}, "GET")
 
-    async def post(self, path, data=None, content=None, headers=None):
-        payload = content if content is not None else data or {}
+    async def post(self, path, data=None, content=None, json=None, headers=None):
+        payload = content if content is not None else json if json is not None else data or {}
         return self._call_handler(path, payload, headers or {}, "POST")
 
     def _call_handler(self, path, payload, headers, method):
@@ -324,6 +324,71 @@ def test_ebay_trading_parser_expands_variations_with_upcs_and_shipping_weight():
     assert items[1].item_specifics["UPC"] == "887276900130"
     assert items[1].sku.startswith("EBAY-123456789012-")
     assert len(items[1].sku) <= 50
+
+
+def test_ebay_lightweight_inventory_parser_includes_variations():
+    payload = b"""<?xml version="1.0" encoding="utf-8"?>
+    <GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+      <Ack>Success</Ack>
+      <ActiveList><ItemArray>
+        <Item>
+          <ItemID>123</ItemID><SKU>PHONE-1</SKU><Quantity>5</Quantity>
+          <SellingStatus><QuantitySold>2</QuantitySold></SellingStatus>
+        </Item>
+        <Item>
+          <ItemID>456</ItemID><Variations>
+            <Variation><SKU>WATCH-BLACK</SKU><Quantity>3</Quantity>
+              <SellingStatus><QuantitySold>1</QuantitySold></SellingStatus></Variation>
+            <Variation><SKU>WATCH-WHITE</SKU><Quantity>1</Quantity>
+              <SellingStatus><QuantitySold>0</QuantitySold></SellingStatus></Variation>
+          </Variations></Item>
+      </ItemArray></ActiveList>
+    </GetMyeBaySellingResponse>"""
+
+    rows = EbayClient._parse_trading_active_inventory(payload)
+
+    assert rows == [
+        {"sku": "PHONE-1", "item_id": "123", "quantity": 3},
+        {"sku": "WATCH-BLACK", "item_id": "456", "quantity": 2},
+        {"sku": "WATCH-WHITE", "item_id": "456", "quantity": 1},
+    ]
+
+
+def test_ebay_revises_legacy_listing_quantity(monkeypatch):
+    requests = []
+
+    def handler(path, payload, headers, method):
+        requests.append((method, path, payload, headers))
+        request = httpx.Request(method, f"https://api.ebay.com{path}")
+        if method == "GET" and path == "/sell/inventory/v1/offer":
+            return httpx.Response(404, json={}, request=request)
+        if method == "POST" and path == "/ws/api.dll":
+            assert headers["X-EBAY-API-CALL-NAME"] == "ReviseInventoryStatus"
+            assert b"<ItemID>123</ItemID>" in payload
+            assert b"<SKU>PHONE-1</SKU>" in payload
+            assert b"<Quantity>2</Quantity>" in payload
+            return httpx.Response(
+                200,
+                content=b'<ReviseInventoryStatusResponse xmlns="urn:ebay:apis:eBLBaseComponents"><Ack>Success</Ack></ReviseInventoryStatusResponse>',
+                request=request,
+            )
+        raise AssertionError(f"Unexpected eBay request: {method} {path}")
+
+    monkeypatch.setattr(ebay_module.httpx, "AsyncClient", lambda *args, **kwargs: FakeAsyncClient(handler))
+    settings = SimpleNamespace(
+        ebay_access_token="seller-token",
+        ebay_marketplace_id="EBAY_US",
+        ebay_trading_compatibility_level="1455",
+    )
+
+    result = asyncio.run(
+        EbayClient(settings).revise_inventory_quantities(
+            [{"sku": "PHONE-1", "item_id": "123", "quantity": 2}]
+        )
+    )
+
+    assert result[0]["status"] == "updated"
+    assert result[0]["api"] == "trading"
 
 
 def test_ebay_trading_enrichment_uses_refreshed_seller_token(monkeypatch):

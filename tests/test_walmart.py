@@ -36,7 +36,7 @@ def test_offer_match_preview_maps_ebay_fields():
     assert offer["productIdentifiers"] == {"productIdType": "UPC", "productId": "887276900123"}
     assert offer["ShippingWeight"] == 1.5
     assert offer["condition"] == "Open Box"
-    assert offer["price"] == 525
+    assert offer["price"] == 577.5
 
 
 def test_offer_match_preview_blocks_missing_identifier_and_weight():
@@ -141,6 +141,9 @@ def test_walmart_draft_preserves_ebay_data_without_inventing_identifier():
     assert draft["status"] == "draft_needs_review"
     assert draft["prepared_listing"]["shipping_weight_lbs"] == 0.5
     assert draft["prepared_listing"]["condition"] == "Open Box"
+    assert draft["prepared_listing"]["price"] == 493.9
+    assert draft["prepared_listing"]["source_price"] == 449
+    assert draft["prepared_listing"]["price_markup_percent"] == 10.0
     assert draft["prepared_listing"]["product_identifier"] is None
     assert draft["catalog_candidates"][0]["walmart_item_id"] == "987"
     assert "product_identifier" in draft["missing_fields"]
@@ -346,3 +349,56 @@ def test_walmart_catalog_keyword_search_returns_sanitized_candidates(monkeypatch
             "identifiers": {"GTIN": "00887276900123"},
         }
     ]
+
+
+def test_walmart_client_reads_published_items_and_inventory(monkeypatch):
+    def handler(method, path, headers, **kwargs):
+        request = httpx.Request(method, f"https://marketplace.walmartapis.com{path}", headers=headers)
+        if path == "/v3/token":
+            return httpx.Response(200, json={"access_token": "access-token"}, request=request)
+        if path == "/v3/items":
+            assert kwargs["params"] == {
+                "publishedStatus": "PUBLISHED",
+                "lifecycleStatus": "ACTIVE",
+                "limit": 1000,
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "ItemResponse": [
+                        {
+                            "sku": "PHONE-1",
+                            "publishedStatus": "PUBLISHED",
+                            "lifecycleStatus": "ACTIVE",
+                        }
+                    ]
+                },
+                request=request,
+            )
+        if path == "/v3/inventory":
+            assert kwargs["params"] == {"sku": "PHONE-1"}
+            return httpx.Response(
+                200,
+                json={"sku": "PHONE-1", "quantity": {"unit": "EACH", "amount": 4}},
+                request=request,
+            )
+        raise AssertionError(f"Unexpected Walmart request: {method} {path}")
+
+    monkeypatch.setattr(
+        walmart_module.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: FakeAsyncClient(handler, *args, **kwargs),
+    )
+    client = WalmartMarketplaceClient(_settings())
+
+    items = asyncio.run(client.list_published_items())
+    quantity = asyncio.run(client.get_inventory_quantity("PHONE-1"))
+
+    assert items == [
+        {
+            "sku": "PHONE-1",
+            "published_status": "PUBLISHED",
+            "lifecycle_status": "ACTIVE",
+        }
+    ]
+    assert quantity == 4

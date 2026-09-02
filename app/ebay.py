@@ -957,6 +957,115 @@ class EbayClient:
                 snapshots.append(self._parse_trading_listing_snapshot(response.content))
         return snapshots
 
+    async def fetch_active_inventory_quantities(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Fetch active seller SKU quantities in one lightweight Trading API call."""
+        request_payload = self._trading_active_inventory_request(limit=limit)
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=45) as client:
+            await self._ensure_access_token(client)
+            response = await self._post_content(
+                client,
+                "/ws/api.dll",
+                content=request_payload,
+                headers=self._trading_headers("GetMyeBaySelling"),
+            )
+            response.raise_for_status()
+        return self._parse_trading_active_inventory(response.content)
+
+    async def revise_inventory_quantities(
+        self,
+        updates: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Update active Inventory API or legacy Trading API listings by seller SKU."""
+        normalized = [
+            {
+                "sku": str(update.get("sku") or "").strip(),
+                "item_id": str(update.get("item_id") or "").strip(),
+                "quantity": max(0, int(update.get("quantity") or 0)),
+            }
+            for update in updates
+            if str(update.get("sku") or "").strip()
+        ]
+        if not normalized:
+            return []
+
+        results: list[dict[str, Any]] = []
+        inventory_api_updates: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        trading_updates: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=45) as client:
+            await self._ensure_access_token(client)
+            for update in normalized:
+                offer = await self._fetch_offer(client, update["sku"])
+                if offer.get("offerId"):
+                    inventory_api_updates.append((update, offer))
+                else:
+                    trading_updates.append(update)
+
+            for start in range(0, len(inventory_api_updates), 25):
+                batch = inventory_api_updates[start : start + 25]
+                payload = {
+                    "requests": [
+                        {
+                            "sku": update["sku"],
+                            "shipToLocationAvailability": {"quantity": update["quantity"]},
+                            "offers": [
+                                {
+                                    "offerId": str(offer["offerId"]),
+                                    "availableQuantity": update["quantity"],
+                                }
+                            ],
+                        }
+                        for update, offer in batch
+                    ]
+                }
+                response = await self._post_json(
+                    client,
+                    "/sell/inventory/v1/bulk_update_price_quantity",
+                    json_data=payload,
+                    headers=self._headers(),
+                )
+                response.raise_for_status()
+                response_payload = response.json() if response.content else {}
+                response_rows = response_payload.get("responses") or []
+                response_by_sku = {
+                    str(row.get("sku") or ""): row
+                    for row in response_rows
+                    if isinstance(row, dict)
+                }
+                for update, _offer in batch:
+                    row = response_by_sku.get(update["sku"], {})
+                    status_code = int(row.get("statusCode") or 200)
+                    results.append(
+                        {
+                            **update,
+                            "status": "updated" if 200 <= status_code < 300 else "failed",
+                            "api": "inventory",
+                            "status_code": status_code,
+                        }
+                    )
+
+            for start in range(0, len(trading_updates), 4):
+                batch = trading_updates[start : start + 4]
+                request_payload = self._trading_revise_inventory_request(batch)
+                response = await self._post_content(
+                    client,
+                    "/ws/api.dll",
+                    content=request_payload,
+                    headers=self._trading_headers("ReviseInventoryStatus"),
+                )
+                response.raise_for_status()
+                result = self._parse_trading_ack(response.content)
+                status = "updated" if result["ack"] in {"Success", "Warning"} else "failed"
+                for update in batch:
+                    results.append(
+                        {
+                            **update,
+                            "status": status,
+                            "api": "trading",
+                            "messages": result["messages"],
+                        }
+                    )
+        return results
+
     async def revise_trading_listings(
         self,
         revisions: list[dict[str, Any]],
@@ -1018,6 +1127,80 @@ class EbayClient:
         ET.SubElement(root, "ItemID").text = str(item_id)
         ET.SubElement(root, "DetailLevel").text = "ReturnAll"
         ET.SubElement(root, "IncludeItemSpecifics").text = "true"
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    @staticmethod
+    def _trading_active_inventory_request(*, limit: int = 200) -> bytes:
+        root = ET.Element("GetMyeBaySellingRequest", xmlns="urn:ebay:apis:eBLBaseComponents")
+        active_list = ET.SubElement(root, "ActiveList")
+        ET.SubElement(active_list, "Include").text = "true"
+        pagination = ET.SubElement(active_list, "Pagination")
+        ET.SubElement(pagination, "EntriesPerPage").text = str(max(1, min(limit, 200)))
+        ET.SubElement(pagination, "PageNumber").text = "1"
+        ET.SubElement(root, "HideVariations").text = "false"
+        ET.SubElement(root, "DetailLevel").text = "ReturnAll"
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    @classmethod
+    def _parse_trading_active_inventory(cls, payload: bytes | str) -> list[dict[str, Any]]:
+        root = ET.fromstring(payload)
+        ack = cls._xml_text(root, "Ack") or "Failure"
+        if ack not in {"Success", "Warning"}:
+            messages = [
+                cls._xml_text(error, "LongMessage") or cls._xml_text(error, "ShortMessage")
+                for error in cls._xml_children(root, "Errors")
+            ]
+            raise ValueError("; ".join(message for message in messages if message) or ack)
+
+        item_array = cls._xml_nested_child(root, "ActiveList", "ItemArray")
+        rows: list[dict[str, Any]] = []
+        for item in cls._xml_children(item_array, "Item"):
+            item_id = cls._xml_text(item, "ItemID") or ""
+            variations = cls._xml_nested_child(item, "Variations")
+            variation_rows = cls._xml_children(variations, "Variation")
+            if variation_rows:
+                for variation in variation_rows:
+                    sku = cls._xml_text(variation, "SKU") or ""
+                    if not sku:
+                        continue
+                    total = cls._int_value(cls._xml_text(variation, "Quantity"))
+                    sold = cls._int_value(
+                        cls._xml_nested_text(variation, "SellingStatus", "QuantitySold")
+                    )
+                    rows.append(
+                        {
+                            "sku": sku,
+                            "item_id": item_id,
+                            "quantity": max(0, total - sold),
+                        }
+                    )
+                continue
+
+            sku = cls._xml_text(item, "SKU") or ""
+            if not sku:
+                continue
+            total = cls._int_value(cls._xml_text(item, "Quantity"))
+            sold = cls._int_value(cls._xml_nested_text(item, "SellingStatus", "QuantitySold"))
+            rows.append({"sku": sku, "item_id": item_id, "quantity": max(0, total - sold)})
+        return rows
+
+    @staticmethod
+    def _trading_revise_inventory_request(updates: list[dict[str, Any]]) -> bytes:
+        if not 1 <= len(updates) <= 4:
+            raise ValueError("ReviseInventoryStatus accepts between one and four updates.")
+        root = ET.Element("ReviseInventoryStatusRequest", xmlns="urn:ebay:apis:eBLBaseComponents")
+        for update in updates:
+            sku = str(update.get("sku") or "").strip()
+            item_id = str(update.get("item_id") or "").strip()
+            if not sku:
+                raise ValueError("An eBay seller SKU is required for quantity updates.")
+            status = ET.SubElement(root, "InventoryStatus")
+            if item_id:
+                ET.SubElement(status, "ItemID").text = item_id
+            ET.SubElement(status, "SKU").text = sku
+            ET.SubElement(status, "Quantity").text = str(max(0, int(update.get("quantity") or 0)))
+        ET.SubElement(root, "ErrorLanguage").text = "en_US"
+        ET.SubElement(root, "WarningLevel").text = "High"
         return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
     @classmethod
