@@ -2518,6 +2518,11 @@ def walmart_auto_publish_current_status() -> dict[str, Any]:
             "model": settings.walmart_gtin_lookup_model,
             "max_per_run": int(settings.walmart_gtin_lookup_max_per_run),
             "retry_seconds": int(settings.walmart_gtin_lookup_retry_seconds),
+            **(
+                walmart_auto_publish_status.get("gtin_lookup")
+                if isinstance(walmart_auto_publish_status.get("gtin_lookup"), dict)
+                else {}
+            ),
         },
         "excluded_terms": [
             term.strip()
