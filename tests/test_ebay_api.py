@@ -361,12 +361,14 @@ def test_ebay_lightweight_inventory_parser_includes_prices_for_seller_skus():
       <ActiveList><ItemArray>
         <Item>
           <ItemID>123</ItemID><SKU>PHONE-1</SKU>
-          <StartPrice currencyID="USD">499.99</StartPrice><Quantity>1</Quantity>
+          <Quantity>1</Quantity>
+          <SellingStatus><CurrentPrice currencyID="USD">499.99</CurrentPrice></SellingStatus>
         </Item>
         <Item>
           <ItemID>456</ItemID><Variations>
             <Variation><SKU>WATCH-BLACK</SKU>
-              <StartPrice currencyID="USD">299.95</StartPrice><Quantity>2</Quantity>
+              <Quantity>2</Quantity>
+              <SellingStatus><CurrentPrice currencyID="USD">299.95</CurrentPrice></SellingStatus>
             </Variation>
           </Variations>
         </Item>

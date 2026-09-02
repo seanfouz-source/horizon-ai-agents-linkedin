@@ -1258,6 +1258,10 @@ class EbayClient:
                 parent_picture_urls + ([gallery_url] if gallery_url else [])
             )
             item_price_node = cls._xml_child(item, "StartPrice")
+            if item_price_node is None:
+                item_price_node = cls._xml_nested_child(
+                    item, "SellingStatus", "CurrentPrice"
+                )
             item_price = cls._float_value(
                 item_price_node.text if item_price_node is not None else None
             )
@@ -1288,17 +1292,19 @@ class EbayClient:
                         "quantity": max(0, total - sold),
                     }
                     price_node = cls._xml_child(variation, "StartPrice")
+                    if price_node is None:
+                        price_node = cls._xml_nested_child(
+                            variation, "SellingStatus", "CurrentPrice"
+                        )
                     price = cls._float_value(
                         price_node.text if price_node is not None else None
                     )
-                    if price is None:
-                        price = item_price
                     if price is not None:
                         row["start_price"] = price
                         row["currency"] = (
                             price_node.attrib.get("currencyID")
                             if price_node is not None
-                            else item_currency
+                            else None
                         ) or "USD"
                     image_urls = cls._dedupe_urls(
                         cls._variation_images(variation_specifics, picture_map)
