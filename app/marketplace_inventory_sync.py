@@ -14,6 +14,7 @@ from app.walmart import (
     WalmartMarketplaceClient,
     build_inventory_feed,
     build_item_image_maintenance_feed,
+    walmart_price,
 )
 
 
@@ -212,6 +213,7 @@ class MarketplaceInventorySyncer:
                 "updated_ebay": 0,
                 "updated_walmart": 0,
                 "zeroed_walmart": 0,
+                "updated_prices": 0,
                 "image_updates_submitted": 0,
                 "image_updates_confirmed": 0,
                 "last_attempt_at": now_iso,
@@ -257,6 +259,74 @@ class MarketplaceInventorySyncer:
                     now=attempted_at,
                 )
                 self.repository.update_inventory_quantity(sku, 0)
+
+        price_markup_percent = float(
+            getattr(self.walmart_client.settings, "walmart_price_markup_percent", 10.0)
+        )
+        price_targets: dict[str, float] = {}
+        price_candidates: dict[str, tuple[float, float, str]] = {}
+        price_errors: dict[str, str] = {}
+        for sku in common_skus:
+            source_price = ebay_by_sku[sku].get("start_price")
+            if source_price is None:
+                continue
+            currency = str(ebay_by_sku[sku].get("currency") or "USD").strip().upper()
+            if currency != "USD":
+                price_errors[sku] = (
+                    f"eBay price uses {currency or 'an empty currency'}; Walmart US requires USD."
+                )
+                continue
+            target_price = walmart_price(float(source_price), price_markup_percent)
+            if target_price is None or target_price <= 0:
+                price_errors[sku] = "eBay did not return a positive price for Walmart markup."
+                continue
+            price_targets[sku] = target_price
+            previous = states.get(sku) or {}
+            previous_target = previous.get("synced_walmart_price")
+            previous_currency = str(previous.get("price_currency") or "USD").upper()
+            if (
+                previous_target is None
+                or abs(float(previous_target) - target_price) >= 0.005
+                or previous_currency != currency
+            ):
+                price_candidates[sku] = (float(source_price), target_price, currency)
+
+        async def update_walmart_price(
+            sku: str,
+            target_price: float,
+            currency: str,
+        ) -> tuple[str, dict[str, Any] | Exception]:
+            try:
+                async with semaphore:
+                    return sku, await self.walmart_client.update_price(
+                        sku,
+                        target_price,
+                        currency=currency,
+                    )
+            except Exception as exc:
+                return sku, exc
+
+        price_results = dict(
+            await asyncio.gather(
+                *(
+                    update_walmart_price(sku, values[1], values[2])
+                    for sku, values in price_candidates.items()
+                )
+            )
+        )
+        updated_price_skus: set[str] = set()
+        for sku, result in price_results.items():
+            if isinstance(result, Exception):
+                price_errors[sku] = f"Walmart price update failed: {result}"
+                continue
+            updated_price_skus.add(sku)
+            source_price, target_price, currency = price_candidates[sku]
+            self.repository.update_marketplace_price_state(
+                sku,
+                ebay_price=source_price,
+                synced_walmart_price=target_price,
+                price_currency=currency,
+            )
 
         ebay_updates = [
             {
@@ -627,9 +697,28 @@ class MarketplaceInventorySyncer:
                 self.repository.update_inventory_quantity(sku, plan.target_quantity)
 
             image_fields = image_states[sku]
+            ebay_price = (
+                float(source_row["start_price"])
+                if source_row and source_row.get("start_price") is not None
+                else (previous or {}).get("ebay_price")
+            )
+            synced_walmart_price = (
+                price_targets[sku]
+                if sku in updated_price_skus
+                else (previous or {}).get("synced_walmart_price")
+            )
+            price_currency = (
+                str(source_row.get("currency") or "USD").upper()
+                if source_row and source_row.get("start_price") is not None
+                else (previous or {}).get("price_currency")
+            )
             sku_errors = [
                 message
-                for message in (quantity_errors.get(sku), image_errors.get(sku))
+                for message in (
+                    quantity_errors.get(sku),
+                    price_errors.get(sku),
+                    image_errors.get(sku),
+                )
                 if message
             ]
             is_pending = (
@@ -649,6 +738,9 @@ class MarketplaceInventorySyncer:
                 synced_quantity=synced_quantity,
                 pending_walmart_quantity=pending_quantity,
                 pending_walmart_at=pending_at,
+                ebay_price=ebay_price,
+                synced_walmart_price=synced_walmart_price,
+                price_currency=price_currency,
                 ebay_image_signature=image_fields["ebay_image_signature"],
                 ebay_primary_image_url=image_fields["ebay_primary_image_url"],
                 last_ebay_image_scan_at=image_fields["last_ebay_image_scan_at"],
@@ -663,10 +755,16 @@ class MarketplaceInventorySyncer:
                 error_message=" ".join(sku_errors) or None,
             )
 
-        all_errors = {**quantity_errors, **image_errors}
+        all_errors: dict[str, str] = {}
+        for error_source in (quantity_errors, price_errors, image_errors):
+            for sku, message in error_source.items():
+                if sku in all_errors:
+                    all_errors[sku] = f"{all_errors[sku]} {message}"
+                else:
+                    all_errors[sku] = message
         return {
             "status": "partial_error" if all_errors else "ok",
-            "checked": len(plans),
+            "checked": len(sync_skus),
             "ebay_active_skus": len(ebay_by_sku),
             "ebay_image_skus": sum(
                 1 for row in ebay_by_sku.values() if row["image_urls"]
@@ -680,6 +778,8 @@ class MarketplaceInventorySyncer:
                 if walmart_submission
                 else 0
             ),
+            "updated_prices": len(updated_price_skus),
+            "price_markup_percent": price_markup_percent,
             "image_updates_submitted": len(maintenance_skus) if image_submission else 0,
             "image_updates_confirmed": image_updates_confirmed,
             "walmart_submission": walmart_submission,

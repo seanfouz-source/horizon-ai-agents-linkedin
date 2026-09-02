@@ -96,6 +96,9 @@ def test_inventory_sync_state_is_persistent(tmp_path):
         synced_quantity=3,
         pending_walmart_quantity=3,
         pending_walmart_at="2026-09-02T12:00:00+00:00",
+        ebay_price=100.0,
+        synced_walmart_price=110.0,
+        price_currency="USD",
         ebay_image_signature="new-images",
         synced_image_signature="old-images",
         pending_walmart_image_signature="new-images",
@@ -107,6 +110,9 @@ def test_inventory_sync_state_is_persistent(tmp_path):
 
     assert stored["sku"] == "PHONE-1"
     assert stored["pending_walmart_quantity"] == 3
+    assert stored["ebay_price"] == 100.0
+    assert stored["synced_walmart_price"] == 110.0
+    assert stored["price_currency"] == "USD"
     assert stored["pending_walmart_image_signature"] == "new-images"
     assert stored["last_image_feed_id"] == "IMAGE@123"
     assert repository.marketplace_inventory_sync_summary()["by_status"] == {"pending": 1}
@@ -119,6 +125,8 @@ class FakeEbayClient:
                 "sku": "PHONE-LIVE",
                 "item_id": "100",
                 "quantity": 2,
+                "start_price": 100.0,
+                "currency": "USD",
                 "image_urls": [
                     "https://i.ebayimg.com/images/g/new-main/s-l1600.jpg",
                     "https://i.ebayimg.com/images/g/new-back/s-l1600.jpg",
@@ -152,11 +160,13 @@ class FakeEbayClient:
 class FakeWalmartClient:
     def __init__(self):
         self.settings = SimpleNamespace(
-            walmart_maintenance_spec_version="5.0.20260608-18_15_07-api"
+            walmart_maintenance_spec_version="5.0.20260608-18_15_07-api",
+            walmart_price_markup_percent=10.0,
         )
         self.quantities = {"PHONE-LIVE": 2, "PHONE-ENDED": 1}
         self.inventory_payloads = []
         self.image_payloads = []
+        self.price_updates = []
         self.feed_status = {"feedStatus": "RECEIVED"}
 
     async def list_published_items(self, *, limit):
@@ -190,6 +200,12 @@ class FakeWalmartClient:
     async def submit_item_maintenance_feed(self, payload):
         self.image_payloads.append(payload)
         return {"status": "submitted", "feed_id": "IMAGE@123"}
+
+    async def update_price(self, sku, amount, *, currency="USD"):
+        self.price_updates.append(
+            {"sku": sku, "amount": amount, "currency": currency}
+        )
+        return {"status": "updated", "sku": sku, "price": amount}
 
     async def get_feed_status(self, feed_id):
         assert feed_id == "IMAGE@123"
@@ -236,6 +252,11 @@ def test_syncer_updates_changed_images_and_zeroes_ended_listing(tmp_path):
     first = asyncio.run(syncer.sync_once())
 
     assert first["zeroed_walmart"] == 1
+    assert first["updated_prices"] == 1
+    assert first["price_markup_percent"] == 10.0
+    assert walmart.price_updates == [
+        {"sku": "PHONE-LIVE", "amount": 110.0, "currency": "USD"}
+    ]
     assert first["image_updates_submitted"] == 1
     assert ebay.image_refreshes == [["100"]]
     inventory_rows = walmart.inventory_payloads[0]["Inventory"]
@@ -269,7 +290,24 @@ def test_syncer_updates_changed_images_and_zeroes_ended_listing(tmp_path):
 
     assert second["image_updates_confirmed"] == 1
     assert second["image_updates_submitted"] == 0
+    assert second["updated_prices"] == 0
+    assert len(walmart.price_updates) == 1
     assert len(walmart.image_payloads) == 1
     live_state = repository.marketplace_inventory_sync_state("PHONE-LIVE")
     assert live_state["pending_walmart_image_signature"] is None
     assert live_state["synced_image_signature"] == live_state["ebay_image_signature"]
+    assert live_state["ebay_price"] == 100.0
+    assert live_state["synced_walmart_price"] == 110.0
+
+    ebay.rows[0]["start_price"] = 120.0
+    third = asyncio.run(syncer.sync_once())
+
+    assert third["updated_prices"] == 1
+    assert walmart.price_updates[-1] == {
+        "sku": "PHONE-LIVE",
+        "amount": 132.0,
+        "currency": "USD",
+    }
+    live_state = repository.marketplace_inventory_sync_state("PHONE-LIVE")
+    assert live_state["ebay_price"] == 120.0
+    assert live_state["synced_walmart_price"] == 132.0

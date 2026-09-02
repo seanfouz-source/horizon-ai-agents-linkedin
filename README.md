@@ -255,8 +255,13 @@ Once an item is published on Walmart, the production service reconciles its
 quantity with the matching eBay seller SKU every 60 seconds. The first pass
 treats eBay as the source quantity; after that, a change on either marketplace
 flows to the other. If both quantities change between passes, the lower number
-wins to prevent overselling. Walmart drafts and unpublished items are excluded.
-The status endpoint is:
+wins to prevent overselling. The same worker treats eBay as the price source and
+updates Walmart's regular price whenever the eBay price changes, always applying
+`WALMART_PRICE_MARKUP_PERCENT` (10% in production). Price changes are one-way
+from eBay to Walmart so a Walmart edit cannot accidentally lower the source eBay
+price. Transient Walmart 5xx responses, including edge HTTP 520 errors, are
+retried automatically. Walmart drafts and unpublished items are excluded. The
+status endpoint is:
 
 ```text
 GET /inventory/sync/marketplaces/status

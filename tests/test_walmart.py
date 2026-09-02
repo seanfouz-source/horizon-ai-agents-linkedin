@@ -483,6 +483,89 @@ def test_walmart_client_reads_published_items_and_inventory(monkeypatch):
     assert quantity == 4
 
 
+def test_walmart_client_updates_regular_price(monkeypatch):
+    requests = []
+
+    def handler(method, path, headers, **kwargs):
+        requests.append((method, path, headers, kwargs))
+        request = httpx.Request(
+            method,
+            f"https://marketplace.walmartapis.com{path}",
+            headers=headers,
+        )
+        if path == "/v3/token":
+            return httpx.Response(200, json={"access_token": "access-token"}, request=request)
+        if path == "/v3/price":
+            assert method == "PUT"
+            assert headers["Content-Type"] == "application/json"
+            assert kwargs["json"] == {
+                "sku": "PHONE-1",
+                "pricing": [
+                    {
+                        "currentPriceType": "BASE",
+                        "currentPrice": {"currency": "USD", "amount": 110.0},
+                    }
+                ],
+            }
+            return httpx.Response(
+                200,
+                json={"ItemPriceResponse": {"sku": "PHONE-1"}},
+                request=request,
+            )
+        raise AssertionError(f"Unexpected Walmart request: {method} {path}")
+
+    monkeypatch.setattr(
+        walmart_module.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: FakeAsyncClient(handler, *args, **kwargs),
+    )
+
+    result = asyncio.run(WalmartMarketplaceClient(_settings()).update_price("PHONE-1", 110))
+
+    assert result["status"] == "updated"
+    assert result["price"] == 110.0
+    assert [request[1] for request in requests] == ["/v3/token", "/v3/price"]
+
+
+def test_walmart_client_retries_http_520(monkeypatch):
+    inventory_attempts = 0
+
+    def handler(method, path, headers, **kwargs):
+        nonlocal inventory_attempts
+        request = httpx.Request(
+            method,
+            f"https://marketplace.walmartapis.com{path}",
+            headers=headers,
+        )
+        if path == "/v3/token":
+            return httpx.Response(200, json={"access_token": "access-token"}, request=request)
+        if path == "/v3/inventory":
+            inventory_attempts += 1
+            if inventory_attempts < 3:
+                return httpx.Response(520, json={"message": "temporary error"}, request=request)
+            return httpx.Response(
+                200,
+                json={"quantity": {"unit": "EACH", "amount": 4}},
+                request=request,
+            )
+        raise AssertionError(f"Unexpected Walmart request: {method} {path}")
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(
+        walmart_module.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: FakeAsyncClient(handler, *args, **kwargs),
+    )
+    monkeypatch.setattr(walmart_module.asyncio, "sleep", no_sleep)
+
+    quantity = asyncio.run(WalmartMarketplaceClient(_settings()).get_inventory_quantity("PHONE-1"))
+
+    assert quantity == 4
+    assert inventory_attempts == 3
+
+
 def test_walmart_client_treats_not_found_items_catalog_as_empty(monkeypatch):
     def handler(method, path, headers, **kwargs):
         request = httpx.Request(method, f"https://marketplace.walmartapis.com{path}", headers=headers)

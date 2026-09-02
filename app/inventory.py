@@ -119,6 +119,9 @@ CREATE TABLE IF NOT EXISTS marketplace_inventory_sync_state (
     synced_quantity INTEGER NOT NULL,
     pending_walmart_quantity INTEGER,
     pending_walmart_at TEXT,
+    ebay_price REAL,
+    synced_walmart_price REAL,
+    price_currency TEXT,
     ebay_image_signature TEXT,
     ebay_primary_image_url TEXT,
     last_ebay_image_scan_at TEXT,
@@ -198,6 +201,15 @@ class InventoryRepository:
                 connection.execute(
                     f"ALTER TABLE marketplace_inventory_sync_state ADD COLUMN {name} TEXT"
                 )
+        for name in ("ebay_price", "synced_walmart_price"):
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE marketplace_inventory_sync_state ADD COLUMN {name} REAL"
+                )
+        if "price_currency" not in columns:
+            connection.execute(
+                "ALTER TABLE marketplace_inventory_sync_state ADD COLUMN price_currency TEXT"
+            )
 
     def count(self) -> int:
         with self.connect() as connection:
@@ -652,6 +664,9 @@ class InventoryRepository:
         synced_quantity: int,
         pending_walmart_quantity: int | None = None,
         pending_walmart_at: str | None = None,
+        ebay_price: float | None = None,
+        synced_walmart_price: float | None = None,
+        price_currency: str | None = None,
         ebay_image_signature: str | None = None,
         ebay_primary_image_url: str | None = None,
         last_ebay_image_scan_at: str | None = None,
@@ -670,13 +685,14 @@ class InventoryRepository:
                 INSERT INTO marketplace_inventory_sync_state (
                     sku, ebay_item_id, ebay_quantity, walmart_quantity,
                     synced_quantity, pending_walmart_quantity, pending_walmart_at,
+                    ebay_price, synced_walmart_price, price_currency,
                     ebay_image_signature, ebay_primary_image_url,
                     last_ebay_image_scan_at, synced_image_signature,
                     pending_walmart_image_signature, pending_walmart_image_at,
                     last_image_feed_id,
                     last_source, status, error_message, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sku) DO UPDATE SET
                     ebay_item_id = excluded.ebay_item_id,
                     ebay_quantity = excluded.ebay_quantity,
@@ -684,6 +700,9 @@ class InventoryRepository:
                     synced_quantity = excluded.synced_quantity,
                     pending_walmart_quantity = excluded.pending_walmart_quantity,
                     pending_walmart_at = excluded.pending_walmart_at,
+                    ebay_price = excluded.ebay_price,
+                    synced_walmart_price = excluded.synced_walmart_price,
+                    price_currency = excluded.price_currency,
                     ebay_image_signature = excluded.ebay_image_signature,
                     ebay_primary_image_url = excluded.ebay_primary_image_url,
                     last_ebay_image_scan_at = excluded.last_ebay_image_scan_at,
@@ -708,6 +727,13 @@ class InventoryRepository:
                         else None
                     ),
                     pending_walmart_at,
+                    float(ebay_price) if ebay_price is not None else None,
+                    (
+                        float(synced_walmart_price)
+                        if synced_walmart_price is not None
+                        else None
+                    ),
+                    str(price_currency).upper() if price_currency else None,
                     ebay_image_signature,
                     ebay_primary_image_url,
                     last_ebay_image_scan_at,
@@ -722,6 +748,31 @@ class InventoryRepository:
                 ),
             )
         return self.marketplace_inventory_sync_state(sku) or {}
+
+    def update_marketplace_price_state(
+        self,
+        sku: str,
+        *,
+        ebay_price: float,
+        synced_walmart_price: float,
+        price_currency: str = "USD",
+    ) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE marketplace_inventory_sync_state
+                SET ebay_price = ?, synced_walmart_price = ?, price_currency = ?, updated_at = ?
+                WHERE sku = ?
+                """,
+                (
+                    float(ebay_price),
+                    float(synced_walmart_price),
+                    str(price_currency or "USD").upper(),
+                    datetime.now(timezone.utc).isoformat(),
+                    str(sku),
+                ),
+            )
+        return bool(cursor.rowcount)
 
     def marketplace_inventory_sync_summary(self) -> dict[str, Any]:
         with self.connect() as connection:

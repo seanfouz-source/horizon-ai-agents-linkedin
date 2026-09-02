@@ -4,7 +4,7 @@ import re
 import uuid
 from base64 import b64encode
 from datetime import date
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Iterable
 from urllib.parse import quote
 
@@ -14,7 +14,7 @@ from app.config import Settings
 from app.models import InventoryItem, WalmartItemOverride
 
 
-RETRY_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504}
+RETRY_STATUS_CODES = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
 RETRY_DELAYS_SECONDS = (0.5, 1.0, 2.0)
 PRODUCT_ID_TYPES = ("GTIN", "UPC", "EAN", "ISBN")
 CONDITION_IMAGE_REQUIRED = {
@@ -289,6 +289,57 @@ class WalmartMarketplaceClient:
                 f"Walmart inventory response did not include a quantity for SKU {clean_sku}."
             ) from exc
 
+    async def update_price(
+        self,
+        sku: str,
+        amount: float,
+        *,
+        currency: str = "USD",
+    ) -> dict[str, Any]:
+        clean_sku = str(sku or "").strip()
+        if not clean_sku:
+            raise WalmartApiError("A Walmart seller SKU is required.")
+        clean_currency = str(currency or "USD").strip().upper()
+        if clean_currency != "USD":
+            raise WalmartApiError(
+                f"Walmart US price updates require USD; received {clean_currency or 'an empty currency'}."
+            )
+        try:
+            clean_amount = float(
+                Decimal(str(amount)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            )
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise WalmartApiError("Walmart price updates require a numeric amount.") from exc
+        if clean_amount <= 0:
+            raise WalmartApiError("Walmart price updates require a positive amount.")
+
+        response = await self._request(
+            "PUT",
+            "/v3/price",
+            headers={"Content-Type": "application/json"},
+            json={
+                "sku": clean_sku,
+                "pricing": [
+                    {
+                        "currentPriceType": "BASE",
+                        "currentPrice": {
+                            "currency": clean_currency,
+                            "amount": clean_amount,
+                        },
+                    }
+                ],
+            },
+        )
+        result = self._json_object(response)
+        return {
+            "status": "updated",
+            "sku": clean_sku,
+            "price": clean_amount,
+            "currency": clean_currency,
+            "response": result,
+            "correlation_id": response.request.headers.get("WM_QOS.CORRELATION_ID"),
+        }
+
     async def _get_access_token(self, *, force: bool = False) -> str:
         if self._access_token and not force:
             return self._access_token
@@ -331,11 +382,10 @@ class WalmartMarketplaceClient:
 
     async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         token = await self._get_access_token()
-        correlation_id = str(uuid.uuid4())
         headers = {
             "Accept": "application/json",
             "WM_SEC.ACCESS_TOKEN": token,
-            "WM_QOS.CORRELATION_ID": correlation_id,
+            "WM_QOS.CORRELATION_ID": str(uuid.uuid4()),
             "WM_SVC.NAME": self.settings.walmart_service_name,
             "WM_MARKET": self.settings.walmart_market,
         }
@@ -345,9 +395,18 @@ class WalmartMarketplaceClient:
         headers.update(kwargs.pop("headers", {}))
 
         response: httpx.Response | None = None
+        last_transport_error: httpx.TransportError | None = None
         async with httpx.AsyncClient(base_url=self.base_url, timeout=60) as client:
             for attempt in range(len(RETRY_DELAYS_SECONDS) + 1):
-                response = await client.request(method, path, headers=headers, **kwargs)
+                headers["WM_QOS.CORRELATION_ID"] = str(uuid.uuid4())
+                try:
+                    response = await client.request(method, path, headers=headers, **kwargs)
+                except httpx.TransportError as exc:
+                    last_transport_error = exc
+                    if attempt >= len(RETRY_DELAYS_SECONDS):
+                        break
+                    await asyncio.sleep(RETRY_DELAYS_SECONDS[attempt])
+                    continue
                 if response.status_code == 401 and attempt == 0:
                     headers["WM_SEC.ACCESS_TOKEN"] = await self._get_access_token(force=True)
                     continue
@@ -356,6 +415,10 @@ class WalmartMarketplaceClient:
                 await asyncio.sleep(RETRY_DELAYS_SECONDS[attempt])
 
         if response is None:
+            if last_transport_error is not None:
+                raise WalmartApiError(
+                    f"Walmart {method} {path} failed after retries: {last_transport_error}."
+                ) from last_transport_error
             raise WalmartApiError(f"Walmart {method} {path} did not return a response.")
         self._raise_for_status(response, f"Walmart {method} {path}")
         return response
