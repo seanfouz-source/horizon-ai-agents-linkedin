@@ -116,6 +116,8 @@ def test_inventory_sync_state_is_persistent(tmp_path):
     assert stored["pending_walmart_image_signature"] == "new-images"
     assert stored["last_image_feed_id"] == "IMAGE@123"
     assert repository.marketplace_inventory_sync_summary()["by_status"] == {"pending": 1}
+    assert repository.marketplace_inventory_sync_summary()["pending_quantity"] == 1
+    assert repository.marketplace_inventory_sync_summary()["pending_images"] == 1
 
 
 class FakeEbayClient:

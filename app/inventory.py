@@ -866,12 +866,24 @@ class InventoryRepository:
                 ORDER BY status
                 """
             ).fetchall()
+            pending = connection.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN pending_walmart_quantity IS NOT NULL THEN 1 ELSE 0 END)
+                        AS quantity,
+                    SUM(CASE WHEN pending_walmart_image_signature IS NOT NULL THEN 1 ELSE 0 END)
+                        AS images
+                FROM marketplace_inventory_sync_state
+                """
+            ).fetchone()
             latest = connection.execute(
                 "SELECT MAX(updated_at) AS latest_updated_at FROM marketplace_inventory_sync_state"
             ).fetchone()
         return {
             "total": int(total["total"]),
             "by_status": {str(row["status"]): int(row["total"]) for row in statuses},
+            "pending_quantity": int(pending["quantity"] or 0),
+            "pending_images": int(pending["images"] or 0),
             "latest_updated_at": latest["latest_updated_at"],
         }
 
