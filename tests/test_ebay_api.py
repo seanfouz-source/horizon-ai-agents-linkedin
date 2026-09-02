@@ -354,6 +354,42 @@ def test_ebay_lightweight_inventory_parser_includes_variations():
     ]
 
 
+def test_ebay_lightweight_inventory_parser_includes_current_images():
+    payload = b"""<?xml version="1.0" encoding="utf-8"?>
+    <GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+      <Ack>Success</Ack>
+      <ActiveList><ItemArray>
+        <Item>
+          <ItemID>456</ItemID>
+          <PictureDetails>
+            <PictureURL>https://i.ebayimg.com/images/g/base/s-l1600.jpg</PictureURL>
+          </PictureDetails>
+          <Variations>
+            <Variation><SKU>WATCH-BLACK</SKU><Quantity>2</Quantity>
+              <VariationSpecifics>
+                <NameValueList><Name>Color</Name><Value>Black</Value></NameValueList>
+              </VariationSpecifics>
+            </Variation>
+            <Pictures>
+              <VariationSpecificName>Color</VariationSpecificName>
+              <VariationSpecificPictureSet>
+                <VariationSpecificValue>Black</VariationSpecificValue>
+                <PictureURL>https://i.ebayimg.com/images/g/black/s-l1600.jpg</PictureURL>
+              </VariationSpecificPictureSet>
+            </Pictures>
+          </Variations>
+        </Item>
+      </ItemArray></ActiveList>
+    </GetMyeBaySellingResponse>"""
+
+    rows = EbayClient._parse_trading_active_inventory(payload)
+
+    assert rows[0]["image_urls"] == [
+        "https://i.ebayimg.com/images/g/black/s-l1600.jpg",
+        "https://i.ebayimg.com/images/g/base/s-l1600.jpg",
+    ]
+
+
 def test_ebay_lightweight_inventory_parser_generates_missing_skus():
     payload = b"""<?xml version="1.0" encoding="utf-8"?>
     <GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">

@@ -65,6 +65,7 @@ class Settings(BaseSettings):
     walmart_service_name: str = "Walmart Marketplace"
     walmart_market: str = "us"
     walmart_channel_type: str | None = None
+    walmart_maintenance_spec_version: str = "5.0.20260608-18_15_07-api"
     walmart_default_shipping_weight_lbs: float | None = None
     walmart_price_markup_percent: float = 10.0
     walmart_stage_drafts_on_startup: bool = True

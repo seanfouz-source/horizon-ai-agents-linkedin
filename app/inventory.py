@@ -119,6 +119,11 @@ CREATE TABLE IF NOT EXISTS marketplace_inventory_sync_state (
     synced_quantity INTEGER NOT NULL,
     pending_walmart_quantity INTEGER,
     pending_walmart_at TEXT,
+    ebay_image_signature TEXT,
+    synced_image_signature TEXT,
+    pending_walmart_image_signature TEXT,
+    pending_walmart_image_at TEXT,
+    last_image_feed_id TEXT,
     last_source TEXT NOT NULL,
     status TEXT NOT NULL,
     error_message TEXT,
@@ -159,6 +164,7 @@ class InventoryRepository:
         with self.connect() as connection:
             connection.executescript(SCHEMA)
             self._ensure_inventory_columns(connection)
+            self._ensure_marketplace_sync_columns(connection)
 
     def _ensure_inventory_columns(self, connection: sqlite3.Connection) -> None:
         columns = {
@@ -169,6 +175,25 @@ class InventoryRepository:
             connection.execute("ALTER TABLE inventory_items ADD COLUMN image_urls TEXT NOT NULL DEFAULT '[]'")
         if "listing_status" not in columns:
             connection.execute("ALTER TABLE inventory_items ADD COLUMN listing_status TEXT")
+
+    def _ensure_marketplace_sync_columns(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(marketplace_inventory_sync_state)"
+            ).fetchall()
+        }
+        for name in (
+            "ebay_image_signature",
+            "synced_image_signature",
+            "pending_walmart_image_signature",
+            "pending_walmart_image_at",
+            "last_image_feed_id",
+        ):
+            if name not in columns:
+                connection.execute(
+                    f"ALTER TABLE marketplace_inventory_sync_state ADD COLUMN {name} TEXT"
+                )
 
     def count(self) -> int:
         with self.connect() as connection:
@@ -623,6 +648,11 @@ class InventoryRepository:
         synced_quantity: int,
         pending_walmart_quantity: int | None = None,
         pending_walmart_at: str | None = None,
+        ebay_image_signature: str | None = None,
+        synced_image_signature: str | None = None,
+        pending_walmart_image_signature: str | None = None,
+        pending_walmart_image_at: str | None = None,
+        last_image_feed_id: str | None = None,
         last_source: str,
         status: str,
         error_message: str | None = None,
@@ -634,9 +664,12 @@ class InventoryRepository:
                 INSERT INTO marketplace_inventory_sync_state (
                     sku, ebay_item_id, ebay_quantity, walmart_quantity,
                     synced_quantity, pending_walmart_quantity, pending_walmart_at,
+                    ebay_image_signature, synced_image_signature,
+                    pending_walmart_image_signature, pending_walmart_image_at,
+                    last_image_feed_id,
                     last_source, status, error_message, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(sku) DO UPDATE SET
                     ebay_item_id = excluded.ebay_item_id,
                     ebay_quantity = excluded.ebay_quantity,
@@ -644,6 +677,11 @@ class InventoryRepository:
                     synced_quantity = excluded.synced_quantity,
                     pending_walmart_quantity = excluded.pending_walmart_quantity,
                     pending_walmart_at = excluded.pending_walmart_at,
+                    ebay_image_signature = excluded.ebay_image_signature,
+                    synced_image_signature = excluded.synced_image_signature,
+                    pending_walmart_image_signature = excluded.pending_walmart_image_signature,
+                    pending_walmart_image_at = excluded.pending_walmart_image_at,
+                    last_image_feed_id = excluded.last_image_feed_id,
                     last_source = excluded.last_source,
                     status = excluded.status,
                     error_message = excluded.error_message,
@@ -661,6 +699,11 @@ class InventoryRepository:
                         else None
                     ),
                     pending_walmart_at,
+                    ebay_image_signature,
+                    synced_image_signature,
+                    pending_walmart_image_signature,
+                    pending_walmart_image_at,
+                    last_image_feed_id,
                     str(last_source),
                     str(status),
                     error_message,

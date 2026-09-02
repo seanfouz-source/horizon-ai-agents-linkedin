@@ -8,6 +8,7 @@ from app.models import InventoryItem, WalmartItemOverride
 from app.walmart import (
     WalmartMarketplaceClient,
     build_inventory_feed,
+    build_item_image_maintenance_feed,
     build_offer_match_preview,
     build_walmart_catalog_query,
     build_walmart_draft,
@@ -108,6 +109,43 @@ def test_inventory_feed_includes_zero_quantity_for_ended_listings():
 
     assert payload["InventoryHeader"] == {"version": "1.4"}
     assert [row["quantity"]["amount"] for row in payload["Inventory"]] == [2, 0]
+
+
+def test_item_image_maintenance_feed_matches_current_walmart_schema():
+    payload = build_item_image_maintenance_feed(
+        [
+            {
+                "sku": "PHONE-1",
+                "product_type": "Cell Phones",
+                "product_id_type": "GTIN",
+                "product_id": "00123456789012",
+                "image_urls": [
+                    "https://i.ebayimg.com/images/g/new-main/s-l1600.jpg",
+                    "https://i.ebayimg.com/images/g/new-back/s-l1600.jpg",
+                ],
+            }
+        ]
+    )
+
+    assert payload["MPItemFeedHeader"] == {
+        "businessUnit": "WALMART_US",
+        "locale": "en",
+        "version": "5.0.20260608-18_15_07-api",
+    }
+    item = payload["MPItem"][0]
+    assert item["Orderable"] == {
+        "sku": "PHONE-1",
+        "productIdentifiers": {
+            "productIdType": "GTIN",
+            "productId": "00123456789012",
+        },
+    }
+    assert item["Visible"]["Cell Phones"]["mainImageUrl"].endswith(
+        "new-main/s-l1600.jpg"
+    )
+    assert item["Visible"]["Cell Phones"]["productSecondaryImageURL"] == [
+        "https://i.ebayimg.com/images/g/new-back/s-l1600.jpg"
+    ]
 
 
 def test_walmart_draft_preserves_ebay_data_without_inventing_identifier():
@@ -269,6 +307,47 @@ def test_walmart_client_authenticates_and_submits_match_feed(monkeypatch):
 
     assert result["feed_id"] == "FEED@123"
     assert [request[1] for request in requests] == ["/v3/token", "/v3/feeds"]
+
+
+def test_walmart_client_submits_item_maintenance_feed(monkeypatch):
+    requests = []
+
+    def handler(method, path, headers, **kwargs):
+        requests.append((method, path, headers, kwargs))
+        request = httpx.Request(
+            method,
+            f"https://marketplace.walmartapis.com{path}",
+            headers=headers,
+        )
+        if path == "/v3/token":
+            return httpx.Response(200, json={"access_token": "access-token"}, request=request)
+        if path == "/v3/feeds":
+            assert kwargs["params"] == {"feedType": "MP_MAINTENANCE"}
+            assert kwargs["json"]["MPItem"][0]["Orderable"]["sku"] == "PHONE-1"
+            return httpx.Response(200, json={"feedId": "IMAGE@123"}, request=request)
+        raise AssertionError(f"Unexpected Walmart request: {method} {path}")
+
+    monkeypatch.setattr(
+        walmart_module.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: FakeAsyncClient(handler, *args, **kwargs),
+    )
+    client = WalmartMarketplaceClient(_settings())
+
+    result = asyncio.run(
+        client.submit_item_maintenance_feed(
+            {
+                "MPItemFeedHeader": {
+                    "businessUnit": "WALMART_US",
+                    "locale": "en",
+                    "version": "5.0.20260608-18_15_07-api",
+                },
+                "MPItem": [{"Orderable": {"sku": "PHONE-1"}}],
+            }
+        )
+    )
+
+    assert result["feed_id"] == "IMAGE@123"
 
 
 def test_walmart_catalog_search_reports_match(monkeypatch):

@@ -168,6 +168,26 @@ class WalmartMarketplaceClient:
             "correlation_id": response.request.headers.get("WM_QOS.CORRELATION_ID"),
         }
 
+    async def submit_item_maintenance_feed(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = await self._request(
+            "POST",
+            "/v3/feeds",
+            params={"feedType": "MP_MAINTENANCE"},
+            json=payload,
+        )
+        result = self._json_object(response)
+        feed_id = result.get("feedId")
+        if not isinstance(feed_id, str) or not feed_id:
+            raise WalmartApiError(
+                "Walmart accepted the item maintenance request but did not return a feedId."
+            )
+        return {
+            "status": "submitted",
+            "feed_type": "MP_MAINTENANCE",
+            "feed_id": feed_id,
+            "correlation_id": response.request.headers.get("WM_QOS.CORRELATION_ID"),
+        }
+
     async def get_feed_status(
         self,
         feed_id: str,
@@ -215,18 +235,35 @@ class WalmartMarketplaceClient:
         if not isinstance(raw_items, list):
             raw_items = []
         return [
-            {
-                "sku": str(item.get("sku") or "").strip(),
-                "published_status": str(
-                    item.get("publishedStatus") or item.get("published_status") or ""
-                ).upper(),
-                "lifecycle_status": str(
-                    item.get("lifecycleStatus") or item.get("lifecycle_status") or ""
-                ).upper(),
-            }
+            summary
             for item in raw_items
-            if isinstance(item, dict) and str(item.get("sku") or "").strip()
+            if isinstance(item, dict)
+            and (summary := _published_item_summary(item)) is not None
         ]
+
+    async def get_item_details(self, sku: str) -> dict[str, Any]:
+        clean_sku = str(sku or "").strip()
+        if not clean_sku:
+            raise WalmartApiError("A Walmart seller SKU is required.")
+        response = await self._request(
+            "GET",
+            f"/v3/items/{quote(clean_sku, safe='')}",
+            params={"productIdType": "SKU"},
+        )
+        payload = self._json_object(response)
+        raw_item: object = payload.get("ItemResponse") or payload.get("itemResponse") or payload
+        if isinstance(raw_item, list):
+            raw_item = raw_item[0] if raw_item else None
+        if not isinstance(raw_item, dict):
+            raise WalmartApiError(
+                f"Walmart item details returned an unexpected response for SKU {clean_sku}."
+            )
+        summary = _published_item_summary(raw_item)
+        if summary is None:
+            raise WalmartApiError(
+                f"Walmart item details did not include a SKU for {clean_sku}."
+            )
+        return summary
 
     async def get_inventory_quantity(self, sku: str) -> int:
         clean_sku = str(sku or "").strip()
@@ -410,6 +447,113 @@ def build_inventory_feed(items: Iterable[InventoryItem]) -> dict[str, Any]:
         for item in items
     ]
     return {"InventoryHeader": {"version": "1.4"}, "Inventory": inventory}
+
+
+def build_item_image_maintenance_feed(
+    items: Iterable[dict[str, Any]],
+    *,
+    version: str = "5.0.20260608-18_15_07-api",
+) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    for item in items:
+        sku = str(item.get("sku") or "").strip()
+        product_type = str(item.get("product_type") or "").strip()
+        product_id_type = str(item.get("product_id_type") or "GTIN").strip().upper()
+        product_id = _digits(item.get("product_id"))
+        image_urls = _maintenance_image_urls(item.get("image_urls"))
+        if not sku:
+            raise ValueError("Walmart item maintenance requires a seller SKU.")
+        if not product_type:
+            raise ValueError(f"Walmart item maintenance requires a product type for SKU {sku}.")
+        if product_id_type not in PRODUCT_ID_TYPES or not product_id:
+            raise ValueError(f"Walmart item maintenance requires a product identifier for SKU {sku}.")
+        if not image_urls:
+            raise ValueError(f"Walmart item maintenance requires at least one image for SKU {sku}.")
+        entries.append(
+            {
+                "Orderable": {
+                    "sku": sku,
+                    "productIdentifiers": {
+                        "productIdType": product_id_type,
+                        "productId": product_id,
+                    },
+                },
+                "Visible": {
+                    product_type: {
+                        "mainImageUrl": image_urls[0],
+                        **(
+                            {"productSecondaryImageURL": image_urls[1:]}
+                            if len(image_urls) > 1
+                            else {}
+                        ),
+                    }
+                },
+            }
+        )
+    if not entries:
+        raise ValueError("Walmart item maintenance requires at least one item.")
+    return {
+        "MPItemFeedHeader": {
+            "businessUnit": "WALMART_US",
+            "locale": "en",
+            "version": str(version).strip(),
+        },
+        "MPItem": entries,
+    }
+
+
+def _published_item_summary(item: dict[str, Any]) -> dict[str, Any] | None:
+    sku = str(item.get("sku") or "").strip()
+    if not sku:
+        return None
+    summary: dict[str, Any] = {
+        "sku": sku,
+        "published_status": str(
+            item.get("publishedStatus") or item.get("published_status") or ""
+        ).upper(),
+        "lifecycle_status": str(
+            item.get("lifecycleStatus") or item.get("lifecycle_status") or ""
+        ).upper(),
+    }
+    product_type = str(item.get("productType") or item.get("product_type") or "").strip()
+    if product_type:
+        summary["product_type"] = product_type
+
+    identifiers: dict[str, object] = {}
+    raw_identifiers = item.get("productIdentifiers")
+    if isinstance(raw_identifiers, dict):
+        raw_type = str(raw_identifiers.get("productIdType") or "").upper()
+        raw_value = raw_identifiers.get("productId")
+        if raw_type in PRODUCT_ID_TYPES and raw_value:
+            identifiers[raw_type] = raw_value
+    for identifier_type in PRODUCT_ID_TYPES:
+        raw_value = item.get(identifier_type.lower()) or item.get(identifier_type)
+        if raw_value:
+            identifiers[identifier_type] = raw_value
+    for identifier_type in PRODUCT_ID_TYPES:
+        value = _digits(identifiers.get(identifier_type))
+        if value:
+            summary["product_id_type"] = identifier_type
+            summary["product_id"] = value
+            break
+
+    item_id = str(item.get("itemId") or item.get("wpid") or "").strip()
+    if item_id:
+        summary["item_id"] = item_id
+    return summary
+
+
+def _maintenance_image_urls(value: object) -> list[str]:
+    raw_values = value if isinstance(value, (list, tuple)) else [value]
+    urls: list[str] = []
+    for raw_value in raw_values:
+        url = str(raw_value or "").strip()
+        if not url.startswith("https://") or len(url) > 2500 or url in urls:
+            continue
+        urls.append(url)
+        if len(urls) >= 20:
+            break
+    return urls
 
 
 def build_walmart_catalog_query(item: InventoryItem) -> str:

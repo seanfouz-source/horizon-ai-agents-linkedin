@@ -1215,7 +1215,14 @@ class EbayClient:
             item_id = cls._xml_text(item, "ItemID") or ""
             variations = cls._xml_nested_child(item, "Variations")
             variation_rows = cls._xml_children(variations, "Variation")
+            parent_images = cls._dedupe_urls(
+                cls._xml_child_texts(
+                    cls._xml_child(item, "PictureDetails"),
+                    "PictureURL",
+                )
+            )
             if variation_rows:
+                picture_map = cls._xml_variation_picture_map(variations)
                 for index, variation in enumerate(variation_rows, start=1):
                     seller_sku = cls._xml_text(variation, "SKU") or ""
                     variation_specifics = cls._xml_name_values(
@@ -1235,6 +1242,12 @@ class EbayClient:
                         "item_id": item_id,
                         "quantity": max(0, total - sold),
                     }
+                    image_urls = cls._dedupe_urls(
+                        cls._variation_images(variation_specifics, picture_map)
+                        + parent_images
+                    )
+                    if image_urls:
+                        row["image_urls"] = image_urls
                     if not seller_sku:
                         price_node = cls._xml_child(variation, "StartPrice")
                         price = cls._float_value(
@@ -1263,6 +1276,8 @@ class EbayClient:
             total = cls._int_value(cls._xml_text(item, "Quantity"))
             sold = cls._int_value(cls._xml_nested_text(item, "SellingStatus", "QuantitySold"))
             row = {"sku": sku, "item_id": item_id, "quantity": max(0, total - sold)}
+            if parent_images:
+                row["image_urls"] = parent_images
             if not seller_sku:
                 row["inventory_tracking"] = "item_id"
             rows.append(row)
