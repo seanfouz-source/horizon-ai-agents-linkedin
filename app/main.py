@@ -1029,7 +1029,17 @@ async def _reconcile_walmart_auto_publish_feeds(
                 sku
                 for sku in skus
                 if existing_states.get(sku)
-                not in {"published", "excluded", "blocked_product_id_conflict_remediated"}
+                not in {
+                    "published",
+                    "excluded",
+                    "submitted",
+                    "retryable_offer_error",
+                    "compliance_review",
+                    "blocked_product_id_conflict",
+                    "blocked_product_id_conflict_remediated",
+                    "blocked_offer_error",
+                    "blocked_inventory_error",
+                }
             }
             offer_states.update(_apply_walmart_offer_feed_results(payload, active_skus))
 
@@ -1139,6 +1149,29 @@ async def _reconcile_walmart_auto_publish_feeds(
     }
 
 
+def _walmart_publish_retry_due(draft: dict[str, Any], now: datetime | None = None) -> bool:
+    state = str(draft.get("publish_status") or "")
+    wait_seconds = {
+        "retryable_offer_error": max(
+            900, int(settings.walmart_auto_publish_interval_seconds)
+        ),
+        "compliance_review": 48 * 60 * 60,
+    }.get(state)
+    if wait_seconds is None:
+        return True
+    raw_last_attempt = str(draft.get("last_publish_at") or "").strip()
+    if not raw_last_attempt:
+        return True
+    try:
+        last_attempt = datetime.fromisoformat(raw_last_attempt.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if last_attempt.tzinfo is None:
+        last_attempt = last_attempt.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return (current - last_attempt).total_seconds() >= wait_seconds
+
+
 async def _run_walmart_auto_publish_once(
     auto_request: WalmartAutoPublishRequest,
 ) -> dict[str, Any]:
@@ -1213,7 +1246,6 @@ async def _run_walmart_auto_publish_once(
             "processing",
             "blocked_product_id_conflict",
             "blocked_product_id_conflict_remediated",
-            "compliance_review",
             "blocked_offer_error",
             "blocked_inventory_error",
         }
@@ -1230,6 +1262,10 @@ async def _run_walmart_auto_publish_once(
             if not draft:
                 continue
             publish_status = str(draft.get("publish_status") or "")
+            if publish_status in {"retryable_offer_error", "compliance_review"}:
+                if not _walmart_publish_retry_due(draft):
+                    awaiting_walmart.append(item.sku)
+                    continue
             if publish_status in nonrepeatable_states:
                 awaiting_walmart.append(item.sku)
                 continue

@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import app.main as main_module
 from app.inventory import InventoryRepository
@@ -189,3 +190,31 @@ def test_inventory_not_found_remains_pending_for_a_safe_retry():
     }
 
     assert classify_walmart_inventory_result(result) == "offer_processed_inventory_pending"
+
+
+def test_retryable_offer_uses_the_configured_backoff(monkeypatch):
+    now = datetime(2026, 9, 2, 22, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(main_module.settings, "walmart_auto_publish_interval_seconds", 21600)
+    recent = {
+        "publish_status": "retryable_offer_error",
+        "last_publish_at": (now - timedelta(hours=1)).isoformat(),
+    }
+    old = {
+        "publish_status": "retryable_offer_error",
+        "last_publish_at": (now - timedelta(hours=7)).isoformat(),
+    }
+
+    assert main_module._walmart_publish_retry_due(recent, now) is False
+    assert main_module._walmart_publish_retry_due(old, now) is True
+
+
+def test_compliance_review_waits_full_48_hours():
+    now = datetime(2026, 9, 2, 22, 0, tzinfo=timezone.utc)
+    draft = {
+        "publish_status": "compliance_review",
+        "last_publish_at": (now - timedelta(hours=47)).isoformat(),
+    }
+
+    assert main_module._walmart_publish_retry_due(draft, now) is False
+    draft["last_publish_at"] = (now - timedelta(hours=49)).isoformat()
+    assert main_module._walmart_publish_retry_due(draft, now) is True
