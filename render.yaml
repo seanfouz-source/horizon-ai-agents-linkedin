@@ -99,6 +99,14 @@ services:
         value: "250"
       - key: WALMART_AUTO_PUBLISH_EXCLUDED_TERMS
         value: don toliver,don oliver,otterbox
+      - key: WALMART_GTIN_LOOKUP_ENABLED
+        value: "true"
+      - key: WALMART_GTIN_LOOKUP_MODEL
+        value: gpt-5.4-mini
+      - key: WALMART_GTIN_LOOKUP_MAX_PER_RUN
+        value: "5"
+      - key: WALMART_GTIN_LOOKUP_RETRY_SECONDS
+        value: "604800"
       - key: MARKETPLACE_INVENTORY_SYNC_ENABLED
         value: "true"
       - key: MARKETPLACE_INVENTORY_SYNC_INTERVAL_SECONDS

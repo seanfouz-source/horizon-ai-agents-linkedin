@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     walmart_auto_publish_batch_size: int = 200
     walmart_auto_publish_catalog_limit: int = 250
     walmart_auto_publish_excluded_terms: str = "don toliver,don oliver,otterbox"
+    walmart_gtin_lookup_enabled: bool = True
+    walmart_gtin_lookup_model: str = "gpt-5.4-mini"
+    walmart_gtin_lookup_max_per_run: int = 5
+    walmart_gtin_lookup_retry_seconds: int = 604800
     marketplace_inventory_sync_enabled: bool = True
     marketplace_inventory_sync_interval_seconds: int = 60
     seed_inventory_csv: Path | None = BASE_DIR / "data" / "exactspec_public_store.csv"

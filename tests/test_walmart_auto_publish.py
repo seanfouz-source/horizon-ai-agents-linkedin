@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 import app.main as main_module
 from app.inventory import InventoryRepository
 from app.models import InventoryItem, WalmartAutoPublishRequest
+from app.product_identifier_lookup import ProductIdentifierLookupResult
 from app.walmart_feed_reconciliation import (
     classify_walmart_inventory_result,
     classify_walmart_offer_result,
@@ -65,7 +66,7 @@ def test_auto_publish_previews_submits_current_inventory_and_does_not_repeat(
             "Model": "Samsung Galaxy S25",
             "Storage": "128 GB",
             "Network": "Unlocked",
-            "UPC": "887276900123",
+            "UPC": "887276900124",
             "Shipping Weight": "1 lb",
         },
     )
@@ -77,7 +78,7 @@ def test_auto_publish_previews_submits_current_inventory_and_does_not_repeat(
                 "ebay_item_id": item.ebay_item_id,
                 "source_snapshot": item.model_dump(mode="json"),
                 "prepared_listing": {
-                    "product_identifier": {"type": "UPC", "value": "887276900123"},
+                    "product_identifier": {"type": "UPC", "value": "887276900124"},
                     "shipping_weight_lbs": 1.0,
                 },
                 "catalog_query": item.title,
@@ -233,3 +234,86 @@ def test_compliance_review_waits_full_48_hours():
     assert main_module._walmart_publish_retry_due(draft, now) is False
     draft["last_publish_at"] = (now - timedelta(hours=49)).isoformat()
     assert main_module._walmart_publish_retry_due(draft, now) is True
+
+
+def test_online_identifier_lookup_is_walmart_verified_and_cached(monkeypatch, tmp_path):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    item = InventoryItem(
+        sku="EBAY-MISSING-ID",
+        title="Samsung Galaxy S25 128GB Unlocked Navy",
+        condition="Open box",
+        price=500,
+        quantity=1,
+        image_url="https://example.com/phone.jpg",
+        category="Cell Phones & Smartphones",
+        listing_status="ACTIVE",
+        source="ebay-trading-api",
+        item_specifics={
+            "Brand": "Samsung",
+            "Model": "Samsung Galaxy S25",
+            "Storage": "128 GB",
+            "Device Color": "Navy",
+            "Network": "Unlocked",
+        },
+    )
+    draft = {
+        "sku": item.sku,
+        "ebay_item_id": "123",
+        "source_snapshot": item.model_dump(mode="json"),
+        "prepared_listing": {"product_identifier": None, "shipping_weight_lbs": None},
+        "catalog_candidates": [],
+        "catalog_status": "no_candidates",
+        "status": "draft_needs_review",
+        "missing_fields": ["product_identifier", "shipping_weight_lbs"],
+    }
+    repository.upsert_items([item])
+    repository.upsert_walmart_drafts([draft])
+
+    class FakeLookup:
+        configured = True
+
+        def __init__(self):
+            self.calls = 0
+
+        async def lookup(self, item, candidates):
+            self.calls += 1
+            return ProductIdentifierLookupResult(
+                status="verified",
+                product_id_type="UPC",
+                product_id="887276900124",
+                source_urls=["https://www.bestbuy.com/example"],
+                matched_product="Samsung Galaxy S25 128GB Unlocked Navy",
+                reason="Exact variant matched.",
+            )
+
+    lookup = FakeLookup()
+    client = FakeWalmartClient()
+    monkeypatch.setattr(main_module, "repository", repository)
+    monkeypatch.setattr(main_module, "walmart_client", client)
+    monkeypatch.setattr(main_module, "product_identifier_lookup", lookup)
+    monkeypatch.setattr(main_module.settings, "walmart_gtin_lookup_enabled", True)
+    monkeypatch.setattr(main_module.settings, "walmart_gtin_lookup_retry_seconds", 604800)
+
+    first_budget = main_module._WalmartGtinLookupBudget(1)
+    first = asyncio.run(
+        main_module._resolve_walmart_auto_publish_draft(
+            item, draft, gtin_lookup_budget=first_budget
+        )
+    )
+    second_budget = main_module._WalmartGtinLookupBudget(1)
+    second = asyncio.run(
+        main_module._resolve_walmart_auto_publish_draft(
+            item, draft, gtin_lookup_budget=second_budget
+        )
+    )
+
+    assert first[0].product_id == "887276900124"
+    assert first[2]["identifier_source"] == "verified_online_identifier"
+    assert first_budget.summary()["verified"] == 1
+    assert second[0].product_id == "887276900124"
+    assert second[2]["online_lookup"]["status"] == "verified_cache"
+    assert second_budget.summary()["cache_hits"] == 1
+    assert lookup.calls == 1
+    cached = repository.walmart_product_identifier_cache(item.sku)
+    assert cached["verification_status"] == "verified"
+    assert cached["lookup_attempts"] == 1

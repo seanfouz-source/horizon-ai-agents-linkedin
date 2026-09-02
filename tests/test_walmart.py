@@ -26,7 +26,7 @@ def test_offer_match_preview_maps_ebay_fields():
         price=525,
         quantity=2,
         image_url="https://i.ebayimg.com/images/g/demo/s-l1600.jpg",
-        item_specifics={"UPC": "887276900123", "Shipping Weight": "24 oz"},
+        item_specifics={"UPC": "887276900124", "Shipping Weight": "24 oz"},
         source="ebay-browse-api",
     )
 
@@ -36,7 +36,7 @@ def test_offer_match_preview_maps_ebay_fields():
     assert preview["blocked"] == 0
     offer = preview["payload"]["MPItem"][0]["Item"]
     assert offer["sku"] == "EBAY-123"
-    assert offer["productIdentifiers"] == {"productIdType": "UPC", "productId": "887276900123"}
+    assert offer["productIdentifiers"] == {"productIdType": "UPC", "productId": "887276900124"}
     assert offer["ShippingWeight"] == 1.5
     assert offer["condition"] == "Open Box"
     assert offer["price"] == 577.5
@@ -92,7 +92,7 @@ def test_offer_match_preview_blocks_required_image_over_url_limit():
         price=250,
         quantity=1,
         image_url="https://example.com/" + ("x" * 190) + ".jpg",
-        item_specifics={"UPC": "887276900123", "Shipping Weight": "1 lb"},
+        item_specifics={"UPC": "887276900124", "Shipping Weight": "1 lb"},
     )
 
     preview = build_offer_match_preview([item])
@@ -206,13 +206,13 @@ def test_verified_catalog_match_requires_unique_exact_variant():
             "walmart_item_id": "987",
             "title": "Samsung Galaxy Z Flip5 512GB Gray Factory Unlocked",
             "brand": "Samsung",
-            "identifiers": {"GTIN": "00887276900123"},
+            "identifiers": {"GTIN": "00887276900124"},
         },
         {
             "walmart_item_id": "654",
             "title": "Samsung Galaxy Z Flip5 256GB Gray Factory Unlocked",
             "brand": "Samsung",
-            "identifiers": {"GTIN": "00887276900456"},
+            "identifiers": {"GTIN": "00887276900452"},
         },
     ]
 
@@ -220,11 +220,11 @@ def test_verified_catalog_match_requires_unique_exact_variant():
 
     assert match is not None
     assert match["walmart_item_id"] == "987"
-    assert match["product_id"] == "00887276900123"
+    assert match["product_id"] == "00887276900124"
     assert "Exactly one" in reason
 
 
-def test_verified_catalog_match_rejects_ambiguous_results():
+def test_verified_catalog_match_collapses_duplicate_records_for_the_same_gtin():
     item = InventoryItem(
         sku="EBAY-123",
         title="Apple Watch Series 11 42mm Black",
@@ -243,6 +243,38 @@ def test_verified_catalog_match_rejects_ambiguous_results():
     }
 
     match, reason = select_verified_catalog_match(item, [candidate, dict(candidate)])
+
+    assert match is not None
+    assert match["product_id"] == "00000000000123"
+    assert reason.startswith("Duplicate Walmart catalog records")
+
+
+def test_verified_catalog_match_rejects_multiple_distinct_gtins():
+    item = InventoryItem(
+        sku="EBAY-123",
+        title="Apple Watch Series 11 42mm Black",
+        category="Cell Phones & Accessories:Smart Watches",
+        item_specifics={
+            "Brand": "Apple",
+            "Model": "Apple Watch Series 11",
+            "Size": "42mm",
+            "Color": "Black",
+        },
+    )
+    candidates = [
+        {
+            "title": "Apple Watch Series 11 42mm Black GPS + Cellular",
+            "brand": "Apple",
+            "identifiers": {"GTIN": "00000000000123"},
+        },
+        {
+            "title": "Apple Watch Series 11 42mm Black GPS + Cellular",
+            "brand": "Apple",
+            "identifiers": {"GTIN": "00000000000451"},
+        },
+    ]
+
+    match, reason = select_verified_catalog_match(item, candidates)
 
     assert match is None
     assert reason.startswith("2 catalog candidates")
@@ -293,6 +325,14 @@ def test_parse_walmart_product_page_extracts_upc_and_shipping_weight():
     assert result["brand"] == "Samsung"
     assert result["model"] == "SM-A166U1"
     assert result["shipping_weight_lbs"] == 0.441
+
+
+def test_parse_walmart_product_page_extracts_manufacturer_number_from_page_data():
+    page = '<script>window.__DATA__={"manufactureNumber":"JBLFLIP6BLKAM"}</script>'
+
+    result = parse_walmart_product_page(page)
+
+    assert result["manufacturer_number"] == "JBLFLIP6BLKAM"
 
 
 def test_estimated_shipping_weight_is_conservative_by_category():
@@ -414,7 +454,7 @@ def test_walmart_catalog_search_reports_match(monkeypatch):
         if path == "/v3/token":
             return httpx.Response(200, json={"access_token": "access-token"}, request=request)
         if path == "/v3/items/walmart/search":
-            assert kwargs["params"] == {"upc": "887276900123", "responseFormat": "SPEC"}
+            assert kwargs["params"] == {"upc": "887276900124", "responseFormat": "SPEC"}
             return httpx.Response(
                 200,
                 json={"items": [{"feedType": "MP_ITEM_MATCH", "version": "4.2"}]},
@@ -428,7 +468,7 @@ def test_walmart_catalog_search_reports_match(monkeypatch):
         lambda *args, **kwargs: FakeAsyncClient(handler, *args, **kwargs),
     )
 
-    result = asyncio.run(WalmartMarketplaceClient(_settings()).search_catalog("UPC", "887276900123"))
+    result = asyncio.run(WalmartMarketplaceClient(_settings()).search_catalog("UPC", "887276900124"))
 
     assert result["matched"] is True
     assert result["feed_type"] == "MP_ITEM_MATCH"
@@ -453,7 +493,7 @@ def test_walmart_catalog_keyword_search_returns_sanitized_candidates(monkeypatch
                             "productName": "Samsung Galaxy Z Flip5 512GB",
                             "brand": "Samsung",
                             "productType": "Cell Phones",
-                            "gtin": "00887276900123",
+                            "gtin": "00887276900124",
                             "irrelevantInternalField": "not persisted",
                         }
                     ]
@@ -483,7 +523,7 @@ def test_walmart_catalog_keyword_search_returns_sanitized_candidates(monkeypatch
             "product_type": "Cell Phones",
             "category_path": None,
             "image_url": None,
-            "identifiers": {"GTIN": "00887276900123"},
+            "identifiers": {"GTIN": "00887276900124"},
         }
     ]
 

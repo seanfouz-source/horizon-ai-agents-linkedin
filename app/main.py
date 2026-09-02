@@ -6,7 +6,7 @@ import json
 import logging
 import secrets
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -64,6 +64,11 @@ from app.reports import (
     format_daily_report_pdf,
     report_attachment_filename,
 )
+from app.product_identifier_lookup import (
+    OpenAIProductIdentifierLookup,
+    ProductIdentifierLookupError,
+    product_identifier_fingerprint,
+)
 from app.report_email import (
     ReportEmailError,
     build_message_from_settings,
@@ -81,6 +86,7 @@ from app.walmart import (
     build_inventory_feed,
     build_offer_match_preview,
     estimated_shipping_weight_lbs,
+    normalize_product_identifier,
     plausible_catalog_candidates,
     select_verified_catalog_match,
 )
@@ -99,6 +105,10 @@ settings = get_settings()
 repository = InventoryRepository(settings.resolved_database_path)
 store_syncer = StorePageSyncer(settings, repository)
 walmart_client = WalmartMarketplaceClient(settings)
+product_identifier_lookup = OpenAIProductIdentifierLookup(
+    settings.openai_api_key,
+    model=settings.walmart_gtin_lookup_model,
+)
 ebay_sync_status: dict[str, Any] = {
     "source": "ebay-api",
     "status": "not_run",
@@ -815,9 +825,215 @@ def _walmart_auto_publish_exclusion(item: InventoryItem) -> str | None:
     return next((term for term in terms if term in searchable), None)
 
 
+class _WalmartGtinLookupBudget:
+    def __init__(self, maximum: int) -> None:
+        self.maximum = max(0, int(maximum))
+        self.remaining = self.maximum
+        self.attempted = 0
+        self.cache_hits = 0
+        self.verified = 0
+        self.unresolved = 0
+        self._lock = asyncio.Lock()
+
+    async def claim(self) -> bool:
+        async with self._lock:
+            if self.remaining <= 0:
+                return False
+            self.remaining -= 1
+            self.attempted += 1
+            return True
+
+    async def record(self, outcome: str) -> None:
+        async with self._lock:
+            if outcome == "cache_hit":
+                self.cache_hits += 1
+            elif outcome == "verified":
+                self.verified += 1
+            elif outcome == "unresolved":
+                self.unresolved += 1
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(settings.walmart_gtin_lookup_enabled),
+            "configured": product_identifier_lookup.configured,
+            "model": settings.walmart_gtin_lookup_model,
+            "max_per_run": self.maximum,
+            "attempted": self.attempted,
+            "cache_hits": self.cache_hits,
+            "verified": self.verified,
+            "unresolved": self.unresolved,
+            "remaining": self.remaining,
+        }
+
+
+def _future_iso_timestamp(seconds: int) -> str:
+    return (
+        datetime.now(timezone.utc) + timedelta(seconds=max(60, int(seconds)))
+    ).isoformat()
+
+
+def _cached_lookup_is_deferred(cached: dict[str, Any]) -> bool:
+    raw_next = str(cached.get("next_lookup_at") or "").strip()
+    if not raw_next:
+        return False
+    try:
+        next_lookup = datetime.fromisoformat(raw_next)
+    except ValueError:
+        return False
+    if next_lookup.tzinfo is None:
+        next_lookup = next_lookup.replace(tzinfo=timezone.utc)
+    return next_lookup > datetime.now(timezone.utc)
+
+
+async def _resolve_online_product_identifier(
+    item: InventoryItem,
+    candidates: list[dict[str, Any]],
+    budget: _WalmartGtinLookupBudget,
+) -> tuple[str | None, str | None, dict[str, Any]]:
+    fingerprint = product_identifier_fingerprint(item)
+    cached = repository.walmart_product_identifier_cache(item.sku)
+    if cached and cached.get("source_fingerprint") == fingerprint:
+        product_id_type, product_id = normalize_product_identifier(
+            cached.get("product_id_type"), cached.get("product_id")
+        )
+        if cached.get("verification_status") == "verified" and product_id_type and product_id:
+            await budget.record("cache_hit")
+            return product_id_type, product_id, {
+                "status": "verified_cache",
+                "source_urls": cached.get("source_urls") or [],
+                "matched_product": cached.get("matched_product"),
+            }
+        if _cached_lookup_is_deferred(cached):
+            return None, None, {
+                "status": "cached_unresolved",
+                "reason": cached.get("reason") or "The previous online lookup was unresolved.",
+                "next_lookup_at": cached.get("next_lookup_at"),
+            }
+
+    if not settings.walmart_gtin_lookup_enabled:
+        return None, None, {
+            "status": "disabled",
+            "reason": "Automatic online GTIN lookup is disabled.",
+        }
+    if not product_identifier_lookup.configured:
+        return None, None, {
+            "status": "not_configured",
+            "reason": "OPENAI_API_KEY is not configured for automatic GTIN lookup.",
+        }
+    if not await budget.claim():
+        return None, None, {
+            "status": "run_limit_reached",
+            "reason": "This run reached its online GTIN lookup limit; the next hourly run will continue.",
+        }
+
+    retry_at = _future_iso_timestamp(settings.walmart_gtin_lookup_retry_seconds)
+    try:
+        researched = await product_identifier_lookup.lookup(item, candidates)
+    except ProductIdentifierLookupError as exc:
+        await budget.record("unresolved")
+        repository.upsert_walmart_product_identifier_cache(
+            item.sku,
+            source_fingerprint=fingerprint,
+            verification_status="lookup_error",
+            reason=str(exc),
+            next_lookup_at=_future_iso_timestamp(3600),
+        )
+        return None, None, {"status": "lookup_error", "reason": str(exc)}
+
+    if (
+        researched.status != "verified"
+        or not researched.product_id_type
+        or not researched.product_id
+    ):
+        await budget.record("unresolved")
+        repository.upsert_walmart_product_identifier_cache(
+            item.sku,
+            source_fingerprint=fingerprint,
+            verification_status=researched.status,
+            source_urls=researched.source_urls,
+            matched_product=researched.matched_product,
+            reason=researched.reason,
+            next_lookup_at=retry_at,
+        )
+        return None, None, {
+            "status": researched.status,
+            "reason": researched.reason or "No single verified identifier was found online.",
+            "source_urls": researched.source_urls,
+        }
+
+    try:
+        catalog = await walmart_client.search_catalog(
+            researched.product_id_type,
+            researched.product_id,
+            response_format="SPEC",
+        )
+    except WalmartApiError as exc:
+        await budget.record("unresolved")
+        repository.upsert_walmart_product_identifier_cache(
+            item.sku,
+            source_fingerprint=fingerprint,
+            verification_status="walmart_verification_error",
+            product_id_type=researched.product_id_type,
+            product_id=researched.product_id,
+            source_urls=researched.source_urls,
+            matched_product=researched.matched_product,
+            reason=str(exc),
+            next_lookup_at=_future_iso_timestamp(3600),
+        )
+        return None, None, {
+            "status": "walmart_verification_error",
+            "reason": f"The online identifier could not be checked against Walmart: {exc}",
+        }
+
+    if catalog.get("matched") is not True:
+        await budget.record("unresolved")
+        catalog_status = str(catalog.get("status") or "not_matched")
+        reason = (
+            "The researched identifier requires a full Walmart item setup."
+            if catalog_status == "full_item_required"
+            else "The researched identifier did not match a published Walmart catalog item."
+        )
+        repository.upsert_walmart_product_identifier_cache(
+            item.sku,
+            source_fingerprint=fingerprint,
+            verification_status=catalog_status,
+            product_id_type=researched.product_id_type,
+            product_id=researched.product_id,
+            source_urls=researched.source_urls,
+            matched_product=researched.matched_product,
+            reason=reason,
+            next_lookup_at=retry_at,
+        )
+        return None, None, {
+            "status": catalog_status,
+            "reason": reason,
+            "source_urls": researched.source_urls,
+        }
+
+    await budget.record("verified")
+    repository.upsert_walmart_product_identifier_cache(
+        item.sku,
+        source_fingerprint=fingerprint,
+        verification_status="verified",
+        product_id_type=researched.product_id_type,
+        product_id=researched.product_id,
+        source_urls=researched.source_urls,
+        matched_product=researched.matched_product,
+        reason=researched.reason,
+        next_lookup_at=None,
+    )
+    return researched.product_id_type, researched.product_id, {
+        "status": "verified",
+        "source_urls": researched.source_urls,
+        "matched_product": researched.matched_product,
+    }
+
+
 async def _resolve_walmart_auto_publish_draft(
     item: InventoryItem,
     draft: dict[str, Any],
+    *,
+    gtin_lookup_budget: _WalmartGtinLookupBudget | None = None,
 ) -> tuple[WalmartItemOverride | None, dict[str, Any], dict[str, Any]]:
     prepared = dict(draft.get("prepared_listing") or {})
     candidates = [
@@ -832,57 +1048,70 @@ async def _resolve_walmart_auto_publish_draft(
     matched_candidate: dict[str, Any] | None = None
 
     if isinstance(identifier, dict):
-        product_id_type = str(identifier.get("type") or "").strip().upper() or None
-        product_id = str(identifier.get("value") or "").strip() or None
+        product_id_type, product_id = normalize_product_identifier(
+            identifier.get("type"), identifier.get("value")
+        )
         if product_id_type and product_id:
             identifier_source = "ebay_or_stored_draft"
 
     public_identifier = PUBLIC_CATALOG_IDENTIFIERS.get(item.sku)
     if not product_id and public_identifier:
-        product_id_type = str(public_identifier["product_id_type"])
-        product_id = str(public_identifier["product_id"])
-        identifier_source = "reviewed_public_identifier"
+        product_id_type, product_id = normalize_product_identifier(
+            public_identifier.get("product_id_type"),
+            public_identifier.get("product_id"),
+        )
+        if product_id_type and product_id:
+            identifier_source = "reviewed_public_identifier"
 
+    catalog_resolution_reason = "No verified Walmart catalog identifier was available."
+    online_lookup: dict[str, Any] | None = None
     if not product_id:
-        verified_match, _ = select_verified_catalog_match(item, candidates)
+        verified_match, catalog_resolution_reason = select_verified_catalog_match(item, candidates)
         if verified_match:
             matched_candidate = verified_match
         else:
             plausible, plausible_reason = plausible_catalog_candidates(item, candidates)
-            if len(plausible) != 1:
-                return None, draft, {
-                    "sku": item.sku,
-                    "ready": False,
-                    "reason": plausible_reason,
-                }
-            if not plausible[0].get("walmart_item_id"):
-                return None, draft, {
-                    "sku": item.sku,
-                    "ready": False,
-                    "reason": "The exact catalog candidate did not include a Walmart item ID.",
-                }
-            try:
-                enriched = await walmart_client.enrich_catalog_candidate(plausible[0])
-            except WalmartApiError as exc:
-                return None, draft, {
-                    "sku": item.sku,
-                    "ready": False,
-                    "reason": f"Could not enrich the exact Walmart candidate: {exc}",
-                }
-            candidates = [
-                enriched if candidate is plausible[0] else candidate
-                for candidate in candidates
-            ]
-            matched_candidate, match_reason = select_verified_catalog_match(item, candidates)
-            if not matched_candidate:
-                return None, {**draft, "catalog_candidates": candidates}, {
-                    "sku": item.sku,
-                    "ready": False,
-                    "reason": match_reason,
-                }
-        product_id_type = str(matched_candidate["product_id_type"])
-        product_id = str(matched_candidate["product_id"])
-        identifier_source = "exact_walmart_catalog_candidate"
+            catalog_resolution_reason = plausible_reason
+            if len(plausible) == 1 and plausible[0].get("walmart_item_id"):
+                try:
+                    enriched = await walmart_client.enrich_catalog_candidate(plausible[0])
+                except WalmartApiError as exc:
+                    catalog_resolution_reason = f"Could not enrich the exact Walmart candidate: {exc}"
+                else:
+                    candidates = [
+                        enriched if candidate is plausible[0] else candidate
+                        for candidate in candidates
+                    ]
+                    matched_candidate, catalog_resolution_reason = select_verified_catalog_match(
+                        item, candidates
+                    )
+            elif len(plausible) == 1:
+                catalog_resolution_reason = (
+                    "The exact catalog candidate did not include a Walmart item ID."
+                )
+        if matched_candidate:
+            product_id_type = str(matched_candidate["product_id_type"])
+            product_id = str(matched_candidate["product_id"])
+            identifier_source = "exact_walmart_catalog_candidate"
+
+    if not product_id and gtin_lookup_budget is not None:
+        product_id_type, product_id, online_lookup = await _resolve_online_product_identifier(
+            item, candidates, gtin_lookup_budget
+        )
+        if product_id_type and product_id:
+            identifier_source = "verified_online_identifier"
+
+    if not product_id:
+        reason = catalog_resolution_reason
+        if online_lookup and online_lookup.get("reason"):
+            reason = str(online_lookup["reason"])
+        return None, {**draft, "catalog_candidates": candidates}, {
+            "sku": item.sku,
+            "ready": False,
+            "reason": reason,
+            "catalog_reason": catalog_resolution_reason,
+            "online_lookup": online_lookup,
+        }
 
     shipping_weight = prepared.get("shipping_weight_lbs")
     weight_source = "ebay_or_stored_draft"
@@ -935,6 +1164,7 @@ async def _resolve_walmart_auto_publish_draft(
         "sku": item.sku,
         "ready": True,
         "identifier_source": identifier_source,
+        "online_lookup": online_lookup,
         "weight_source": weight_source,
         "estimated_shipping_weight": weight_source == "conservative_category_estimate",
     }
@@ -1288,6 +1518,9 @@ async def _run_walmart_auto_publish_once(
         )
 
         enrichment_semaphore = asyncio.Semaphore(4)
+        gtin_lookup_budget = _WalmartGtinLookupBudget(
+            settings.walmart_gtin_lookup_max_per_run
+        )
 
         async def resolve_one(
             item: InventoryItem,
@@ -1295,7 +1528,9 @@ async def _run_walmart_auto_publish_once(
         ) -> tuple[InventoryItem, WalmartItemOverride | None, dict[str, Any], dict[str, Any]]:
             async with enrichment_semaphore:
                 override, updated_draft, result = await _resolve_walmart_auto_publish_draft(
-                    item, draft
+                    item,
+                    draft,
+                    gtin_lookup_budget=gtin_lookup_budget,
                 )
             return item, override, updated_draft, result
 
@@ -1370,6 +1605,7 @@ async def _run_walmart_auto_publish_once(
             "awaiting_walmart": awaiting_walmart,
             "excluded": excluded,
             "resolved": resolution_results,
+            "gtin_lookup": gtin_lookup_budget.summary(),
             "ready_skus": ready_skus,
             "blocked_items": (preflight or {}).get("blocked", 0),
             "ebay_sync": ebay_refresh,
@@ -2242,6 +2478,13 @@ def walmart_auto_publish_current_status() -> dict[str, Any]:
         "interval_seconds": max(900, int(settings.walmart_auto_publish_interval_seconds)),
         "initial_delay_seconds": max(60, int(settings.walmart_auto_publish_initial_delay_seconds)),
         "catalog_limit": int(settings.walmart_auto_publish_catalog_limit),
+        "gtin_lookup": {
+            "enabled": bool(settings.walmart_gtin_lookup_enabled),
+            "configured": product_identifier_lookup.configured,
+            "model": settings.walmart_gtin_lookup_model,
+            "max_per_run": int(settings.walmart_gtin_lookup_max_per_run),
+            "retry_seconds": int(settings.walmart_gtin_lookup_retry_seconds),
+        },
         "excluded_terms": [
             term.strip()
             for term in str(settings.walmart_auto_publish_excluded_terms or "").split(",")

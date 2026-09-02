@@ -103,6 +103,24 @@ CREATE TABLE IF NOT EXISTS walmart_listing_drafts (
 CREATE INDEX IF NOT EXISTS idx_walmart_drafts_status ON walmart_listing_drafts(status);
 CREATE INDEX IF NOT EXISTS idx_walmart_drafts_ebay_item_id ON walmart_listing_drafts(ebay_item_id);
 
+CREATE TABLE IF NOT EXISTS walmart_product_identifier_cache (
+    sku TEXT PRIMARY KEY,
+    source_fingerprint TEXT NOT NULL,
+    product_id_type TEXT,
+    product_id TEXT,
+    verification_status TEXT NOT NULL,
+    source_urls TEXT NOT NULL DEFAULT '[]',
+    matched_product TEXT,
+    reason TEXT,
+    lookup_attempts INTEGER NOT NULL DEFAULT 0,
+    last_lookup_at TEXT,
+    next_lookup_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_walmart_identifier_cache_status
+ON walmart_product_identifier_cache(verification_status);
+
 CREATE TABLE IF NOT EXISTS walmart_unpublished_jobs (
     batch_id TEXT PRIMARY KEY,
     status TEXT NOT NULL,
@@ -645,6 +663,92 @@ class InventoryRepository:
                 ),
             )
         return int(cursor.rowcount)
+
+    def walmart_product_identifier_cache(self, sku: str) -> dict[str, Any] | None:
+        clean_sku = str(sku or "").strip()
+        if not clean_sku:
+            return None
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM walmart_product_identifier_cache WHERE sku = ?",
+                (clean_sku,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["source_urls"] = json.loads(result.get("source_urls") or "[]")
+        except (TypeError, ValueError):
+            result["source_urls"] = []
+        return result
+
+    def upsert_walmart_product_identifier_cache(
+        self,
+        sku: str,
+        *,
+        source_fingerprint: str,
+        verification_status: str,
+        product_id_type: str | None = None,
+        product_id: str | None = None,
+        source_urls: Iterable[str] = (),
+        matched_product: str | None = None,
+        reason: str | None = None,
+        next_lookup_at: str | None = None,
+        lookup_attempted: bool = True,
+    ) -> dict[str, Any]:
+        clean_sku = str(sku or "").strip()
+        if not clean_sku:
+            raise ValueError("A SKU is required for the Walmart product identifier cache.")
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO walmart_product_identifier_cache (
+                    sku, source_fingerprint, product_id_type, product_id,
+                    verification_status, source_urls, matched_product, reason,
+                    lookup_attempts, last_lookup_at, next_lookup_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(sku) DO UPDATE SET
+                    source_fingerprint = excluded.source_fingerprint,
+                    product_id_type = excluded.product_id_type,
+                    product_id = excluded.product_id,
+                    verification_status = excluded.verification_status,
+                    source_urls = excluded.source_urls,
+                    matched_product = excluded.matched_product,
+                    reason = excluded.reason,
+                    lookup_attempts = CASE
+                        WHEN walmart_product_identifier_cache.source_fingerprint != excluded.source_fingerprint
+                        THEN excluded.lookup_attempts
+                        ELSE walmart_product_identifier_cache.lookup_attempts + excluded.lookup_attempts
+                    END,
+                    last_lookup_at = CASE
+                        WHEN excluded.lookup_attempts > 0 THEN excluded.last_lookup_at
+                        ELSE walmart_product_identifier_cache.last_lookup_at
+                    END,
+                    next_lookup_at = excluded.next_lookup_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    clean_sku,
+                    str(source_fingerprint),
+                    product_id_type,
+                    product_id,
+                    str(verification_status),
+                    json.dumps([str(url) for url in source_urls if str(url).strip()]),
+                    matched_product,
+                    reason,
+                    1 if lookup_attempted else 0,
+                    now if lookup_attempted else None,
+                    next_lookup_at,
+                    now,
+                    now,
+                ),
+            )
+        cached = self.walmart_product_identifier_cache(clean_sku)
+        if cached is None:
+            raise RuntimeError("The Walmart product identifier cache write did not persist.")
+        return cached
 
     def upsert_walmart_unpublished_job(
         self,

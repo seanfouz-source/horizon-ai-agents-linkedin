@@ -77,7 +77,7 @@ class WalmartMarketplaceClient:
         response_format: str = "SPEC",
     ) -> dict[str, Any]:
         identifier_type = str(product_id_type).strip().upper()
-        if identifier_type not in {"UPC", "GTIN"}:
+        if identifier_type not in PRODUCT_ID_TYPES:
             return {
                 "status": "not_checked",
                 "matched": None,
@@ -94,12 +94,20 @@ class WalmartMarketplaceClient:
         results = items if isinstance(items, list) else []
         first = results[0] if results and isinstance(results[0], dict) else None
         feed_type = str(first.get("feedType") or "") if first else ""
+        matched = feed_type == "MP_ITEM_MATCH"
         return {
-            "status": "matched" if feed_type == "MP_ITEM_MATCH" else "not_matched",
-            "matched": feed_type == "MP_ITEM_MATCH",
+            "status": (
+                "matched"
+                if matched
+                else "full_item_required"
+                if feed_type == "MP_ITEM"
+                else "not_matched"
+            ),
+            "matched": matched,
             "feed_type": feed_type or None,
             "version": first.get("version") if first else None,
             "product_type": first.get("productType") if first else None,
+            "item_spec_payload": first.get("itemSpecPayload") if first else None,
         }
 
     async def search_catalog_by_query(self, query: str, *, limit: int = 5) -> dict[str, Any]:
@@ -777,21 +785,39 @@ def select_verified_catalog_match(
     candidates: Iterable[dict[str, Any]],
 ) -> tuple[dict[str, Any] | None, str]:
     plausible, reason = plausible_catalog_candidates(item, candidates)
-    if len(plausible) != 1:
+    if not plausible:
         return None, reason
 
-    candidate = plausible[0]
+    identified: list[tuple[dict[str, Any], str, str, str]] = []
+    for candidate in plausible:
+        identifiers = candidate.get("identifiers")
+        if not isinstance(identifiers, dict):
+            continue
+        for identifier_type in PRODUCT_ID_TYPES:
+            normalized_type, normalized_value = normalize_product_identifier(
+                identifier_type,
+                identifiers.get(identifier_type),
+            )
+            if normalized_type and normalized_value:
+                canonical = (
+                    f"ISBN:{normalized_value}"
+                    if normalized_type == "ISBN"
+                    else f"GTIN:{normalized_value.zfill(14)}"
+                )
+                identified.append((candidate, normalized_type, normalized_value, canonical))
+                break
+
+    canonical_identifiers = {entry[3] for entry in identified}
+    if len(plausible) == 1 and identified:
+        candidate, selected_type, selected_value, _ = identified[0]
+    elif len(canonical_identifiers) == 1 and identified:
+        candidate, selected_type, selected_value, _ = identified[0]
+    else:
+        return None, reason
+
     identifiers = candidate.get("identifiers")
     if not isinstance(identifiers, dict):
         return None, "The exact catalog candidate does not expose a product identifier."
-    selected_type: str | None = None
-    selected_value: str | None = None
-    for identifier_type in PRODUCT_ID_TYPES:
-        candidate_value = _digits(identifiers.get(identifier_type))
-        if candidate_value and _valid_product_identifier(identifier_type, candidate_value):
-            selected_type = identifier_type
-            selected_value = candidate_value
-            break
     if not selected_type or not selected_value:
         return None, "The exact catalog candidate does not expose a valid product identifier."
     return {
@@ -803,7 +829,11 @@ def select_verified_catalog_match(
         "brand": candidate.get("brand"),
         "shipping_weight_lbs": candidate.get("shipping_weight_lbs"),
         "public_product_url": candidate.get("public_product_url"),
-    }, "Exactly one Walmart catalog candidate passed all verification checks."
+    }, (
+        "Duplicate Walmart catalog records resolved to one verified product identifier."
+        if len(plausible) > 1
+        else "Exactly one Walmart catalog candidate passed all verification checks."
+    )
 
 
 def plausible_catalog_candidates(
@@ -868,6 +898,16 @@ def plausible_catalog_candidates(
         if phone_category and any(carrier not in _carrier_keys(title) for carrier in required_carriers):
             continue
         verified.append(candidate)
+
+    source_condition = _walmart_condition(item.condition)
+    if source_condition == "Open Box":
+        open_box = [
+            candidate
+            for candidate in verified
+            if re.search(r"\bopen[ -]?box\b", str(candidate.get("title") or ""), re.IGNORECASE)
+        ]
+        if open_box:
+            verified = open_box
 
     if len(verified) != 1:
         if verified:
@@ -948,9 +988,18 @@ def parse_walmart_product_page(html_text: str) -> dict[str, Any]:
     product = products[0] if products else {}
     identifiers: dict[str, str] = {}
     for key in ("gtin", "gtin8", "gtin12", "gtin13", "gtin14"):
-        value = _digits(product.get(key))
-        identifier_type = {12: "UPC", 13: "EAN", 14: "GTIN"}.get(len(value))
-        if identifier_type and _valid_product_identifier(identifier_type, value):
+        identifier_type, value = normalize_product_identifier(key, product.get(key))
+        if identifier_type and value:
+            identifiers.setdefault(identifier_type, value)
+
+    decoded = unescape(str(html_text or "")).replace('\\"', '"')
+    for match in re.finditer(
+        r'"(?:gtin|gtin8|gtin12|gtin13|gtin14|upc|ean)"\s*:\s*"?(\d{8,14})"?',
+        decoded,
+        flags=re.IGNORECASE,
+    ):
+        identifier_type, value = normalize_product_identifier("GTIN", match.group(1))
+        if identifier_type and value:
             identifiers.setdefault(identifier_type, value)
 
     brand_value = product.get("brand")
@@ -961,7 +1010,6 @@ def parse_walmart_product_page(html_text: str) -> dict[str, Any]:
         raw_weight = raw_weight.get("value") or raw_weight.get("name")
     weight = _parse_weight_lbs(raw_weight)
     if weight is None:
-        decoded = unescape(str(html_text or "")).replace('\\"', '"')
         weight_match = re.search(
             r'"name"\s*:\s*"(?:Assembled product weight|Shipping weight|Product weight)"'
             r'.{0,240}?"value"\s*:\s*"([^"]+)"',
@@ -971,10 +1019,22 @@ def parse_walmart_product_page(html_text: str) -> dict[str, Any]:
         if weight_match:
             weight = _parse_weight_lbs(weight_match.group(1))
 
+    manufacturer_number = product.get("mpn") or product.get("sku")
+    if not manufacturer_number:
+        manufacturer_match = re.search(
+            r'"(?:manufactureNumber|manufacturerNumber|manufacturerPartNumber|mpn)"'
+            r'\s*:\s*"([^"\\]{2,80})"',
+            decoded,
+            flags=re.IGNORECASE,
+        )
+        if manufacturer_match:
+            manufacturer_number = manufacturer_match.group(1).strip()
+
     return {
         "title": product.get("name"),
         "brand": brand_value,
         "model": product.get("model"),
+        "manufacturer_number": manufacturer_number,
         "identifiers": identifiers,
         "shipping_weight_lbs": weight,
     }
@@ -1068,13 +1128,15 @@ def _product_identifier(
     override: WalmartItemOverride,
 ) -> tuple[str | None, str | None]:
     if override.product_id_type and override.product_id:
-        return override.product_id_type.upper(), _digits(override.product_id)
+        return normalize_product_identifier(override.product_id_type, override.product_id)
 
     specifics = {_normalize_key(key): value for key, value in item.item_specifics.items()}
     for identifier_type in PRODUCT_ID_TYPES:
         value = specifics.get(_normalize_key(identifier_type))
         if value:
-            return identifier_type, _digits(value)
+            normalized_type, normalized_value = normalize_product_identifier(identifier_type, value)
+            if normalized_type and normalized_value:
+                return normalized_type, normalized_value
     return None, None
 
 
@@ -1136,7 +1198,26 @@ def _walmart_condition(value: str | None) -> str | None:
     return exact.get(clean)
 
 
+def normalize_product_identifier(
+    identifier_type: object,
+    value: object,
+) -> tuple[str | None, str | None]:
+    """Return a Walmart identifier type/value only when its check digit is valid."""
+    declared_type = str(identifier_type or "").strip().upper()
+    clean = _digits(value)
+    if not clean:
+        return None, None
+    if declared_type == "ISBN" and len(clean) in {10, 13}:
+        normalized_type = "ISBN"
+    else:
+        normalized_type = {12: "UPC", 13: "EAN", 14: "GTIN"}.get(len(clean))
+    if not normalized_type or not _valid_product_identifier(normalized_type, clean):
+        return None, None
+    return normalized_type, clean
+
+
 def _valid_product_identifier(identifier_type: str, value: str) -> bool:
+    clean_type = str(identifier_type or "").strip().upper()
     if not value.isdigit():
         return False
     lengths = {
@@ -1145,7 +1226,17 @@ def _valid_product_identifier(identifier_type: str, value: str) -> bool:
         "EAN": {13},
         "ISBN": {10, 13},
     }
-    return len(value) in lengths.get(identifier_type, set())
+    if len(value) not in lengths.get(clean_type, set()):
+        return False
+    if clean_type == "ISBN" and len(value) == 10:
+        return sum((10 - index) * int(digit) for index, digit in enumerate(value)) % 11 == 0
+    digits = [int(digit) for digit in value]
+    body = digits[:-1]
+    weighted = sum(
+        digit * (3 if (len(body) - index) % 2 else 1)
+        for index, digit in enumerate(body)
+    )
+    return (10 - weighted % 10) % 10 == digits[-1]
 
 
 def _digits(value: object) -> str:
