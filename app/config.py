@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     walmart_stage_drafts_on_startup: bool = True
     walmart_unpublished_batch_id: str | None = None
     walmart_auto_publish_enabled: bool = True
-    walmart_auto_publish_interval_seconds: int = 21600
+    walmart_auto_publish_interval_seconds: int = 3600
     walmart_auto_publish_initial_delay_seconds: int = 900
     walmart_auto_publish_batch_size: int = 200
     walmart_auto_publish_catalog_limit: int = 250

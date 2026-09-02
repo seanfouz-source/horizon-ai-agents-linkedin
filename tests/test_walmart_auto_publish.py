@@ -192,20 +192,35 @@ def test_inventory_not_found_remains_pending_for_a_safe_retry():
     assert classify_walmart_inventory_result(result) == "offer_processed_inventory_pending"
 
 
-def test_retryable_offer_uses_the_configured_backoff(monkeypatch):
+def test_retryable_offer_uses_exponential_backoff():
     now = datetime(2026, 9, 2, 22, 0, tzinfo=timezone.utc)
-    monkeypatch.setattr(main_module.settings, "walmart_auto_publish_interval_seconds", 21600)
-    recent = {
+    first_failure = {
         "publish_status": "retryable_offer_error",
-        "last_publish_at": (now - timedelta(hours=1)).isoformat(),
+        "publish_attempts": 1,
+        "last_publish_at": (now - timedelta(minutes=59)).isoformat(),
     }
-    old = {
+    second_failure = {
         "publish_status": "retryable_offer_error",
-        "last_publish_at": (now - timedelta(hours=7)).isoformat(),
+        "publish_attempts": 2,
+        "last_publish_at": (now - timedelta(hours=5)).isoformat(),
+    }
+    repeated_failure = {
+        "publish_status": "retryable_offer_error",
+        "publish_attempts": 3,
+        "last_publish_at": (now - timedelta(hours=23)).isoformat(),
     }
 
-    assert main_module._walmart_publish_retry_due(recent, now) is False
-    assert main_module._walmart_publish_retry_due(old, now) is True
+    assert main_module._walmart_publish_retry_due(first_failure, now) is False
+    first_failure["last_publish_at"] = (now - timedelta(hours=1, minutes=1)).isoformat()
+    assert main_module._walmart_publish_retry_due(first_failure, now) is True
+
+    assert main_module._walmart_publish_retry_due(second_failure, now) is False
+    second_failure["last_publish_at"] = (now - timedelta(hours=6, minutes=1)).isoformat()
+    assert main_module._walmart_publish_retry_due(second_failure, now) is True
+
+    assert main_module._walmart_publish_retry_due(repeated_failure, now) is False
+    repeated_failure["last_publish_at"] = (now - timedelta(hours=24, minutes=1)).isoformat()
+    assert main_module._walmart_publish_retry_due(repeated_failure, now) is True
 
 
 def test_compliance_review_waits_full_48_hours():

@@ -90,7 +90,7 @@ services:
       - key: WALMART_AUTO_PUBLISH_ENABLED
         value: "true"
       - key: WALMART_AUTO_PUBLISH_INTERVAL_SECONDS
-        value: "21600"
+        value: "3600"
       - key: WALMART_AUTO_PUBLISH_INITIAL_DELAY_SECONDS
         value: "900"
       - key: WALMART_AUTO_PUBLISH_BATCH_SIZE

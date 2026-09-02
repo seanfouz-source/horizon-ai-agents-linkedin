@@ -1151,12 +1151,17 @@ async def _reconcile_walmart_auto_publish_feeds(
 
 def _walmart_publish_retry_due(draft: dict[str, Any], now: datetime | None = None) -> bool:
     state = str(draft.get("publish_status") or "")
-    wait_seconds = {
-        "retryable_offer_error": max(
-            900, int(settings.walmart_auto_publish_interval_seconds)
-        ),
-        "compliance_review": 48 * 60 * 60,
-    }.get(state)
+    if state == "retryable_offer_error":
+        try:
+            attempts = max(1, int(draft.get("publish_attempts") or 1))
+        except (TypeError, ValueError):
+            attempts = 1
+        retry_delays = (60 * 60, 6 * 60 * 60, 24 * 60 * 60)
+        wait_seconds = retry_delays[min(attempts - 1, len(retry_delays) - 1)]
+    elif state == "compliance_review":
+        wait_seconds = 48 * 60 * 60
+    else:
+        wait_seconds = None
     if wait_seconds is None:
         return True
     raw_last_attempt = str(draft.get("last_publish_at") or "").strip()
