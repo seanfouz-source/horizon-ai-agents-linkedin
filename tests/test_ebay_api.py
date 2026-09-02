@@ -354,6 +354,50 @@ def test_ebay_lightweight_inventory_parser_includes_variations():
     ]
 
 
+def test_ebay_lightweight_inventory_parser_generates_missing_skus():
+    payload = b"""<?xml version="1.0" encoding="utf-8"?>
+    <GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+      <Ack>Success</Ack>
+      <ActiveList><ItemArray>
+        <Item>
+          <ItemID>123</ItemID><Quantity>5</Quantity>
+          <SellingStatus><QuantitySold>2</QuantitySold></SellingStatus>
+        </Item>
+        <Item>
+          <ItemID>456</ItemID><Variations>
+            <Variation><StartPrice currencyID="USD">299.95</StartPrice><Quantity>3</Quantity>
+              <VariationSpecifics>
+                <NameValueList><Name>Color</Name><Value>Black</Value></NameValueList>
+                <NameValueList><Name>Size</Name><Value>44 mm</Value></NameValueList>
+              </VariationSpecifics>
+              <SellingStatus><QuantitySold>1</QuantitySold></SellingStatus>
+            </Variation>
+          </Variations>
+        </Item>
+      </ItemArray></ActiveList>
+    </GetMyeBaySellingResponse>"""
+
+    rows = EbayClient._parse_trading_active_inventory(payload)
+
+    assert rows[0] == {
+        "sku": "EBAY-123",
+        "item_id": "123",
+        "quantity": 3,
+        "inventory_tracking": "item_id",
+    }
+    assert rows[1] == {
+        "sku": EbayClient._generated_variation_sku(
+            "456", {"Color": "Black", "Size": "44 mm"}, 1
+        ),
+        "item_id": "456",
+        "quantity": 2,
+        "inventory_tracking": "variation_specifics",
+        "variation_specifics": {"Color": "Black", "Size": "44 mm"},
+        "start_price": 299.95,
+        "currency": "USD",
+    }
+
+
 def test_ebay_revises_legacy_listing_quantity(monkeypatch):
     requests = []
 
@@ -389,6 +433,65 @@ def test_ebay_revises_legacy_listing_quantity(monkeypatch):
 
     assert result[0]["status"] == "updated"
     assert result[0]["api"] == "trading"
+
+
+def test_ebay_revises_quantities_without_seller_skus(monkeypatch):
+    revise_payloads = []
+
+    def handler(path, payload, headers, method):
+        request = httpx.Request(method, f"https://api.ebay.com{path}")
+        if method == "GET" and path == "/sell/inventory/v1/offer":
+            return httpx.Response(404, json={}, request=request)
+        if method == "POST" and path == "/ws/api.dll":
+            assert headers["X-EBAY-API-CALL-NAME"] == "ReviseFixedPriceItem"
+            revise_payloads.append(payload)
+            return httpx.Response(
+                200,
+                content=b'<ReviseFixedPriceItemResponse xmlns="urn:ebay:apis:eBLBaseComponents"><Ack>Success</Ack></ReviseFixedPriceItemResponse>',
+                request=request,
+            )
+        raise AssertionError(f"Unexpected eBay request: {method} {path}")
+
+    monkeypatch.setattr(ebay_module.httpx, "AsyncClient", lambda *args, **kwargs: FakeAsyncClient(handler))
+    settings = SimpleNamespace(
+        ebay_access_token="seller-token",
+        ebay_marketplace_id="EBAY_US",
+        ebay_trading_compatibility_level="1455",
+    )
+
+    results = asyncio.run(
+        EbayClient(settings).revise_inventory_quantities(
+            [
+                {
+                    "sku": "EBAY-123",
+                    "item_id": "123",
+                    "quantity": 2,
+                    "inventory_tracking": "item_id",
+                },
+                {
+                    "sku": "EBAY-456-generated",
+                    "item_id": "456",
+                    "quantity": 4,
+                    "inventory_tracking": "variation_specifics",
+                    "variation_specifics": {"Color": "Black", "Size": "44 mm"},
+                    "start_price": 299.95,
+                    "currency": "USD",
+                },
+            ]
+        )
+    )
+
+    assert len(revise_payloads) == 2
+    assert b"<ItemID>123</ItemID>" in revise_payloads[0]
+    assert b"<Quantity>2</Quantity>" in revise_payloads[0]
+    assert b"<Variations>" not in revise_payloads[0]
+    assert b"<ItemID>456</ItemID>" in revise_payloads[1]
+    assert b'<StartPrice currencyID="USD">299.95</StartPrice>' in revise_payloads[1]
+    assert b"<Quantity>4</Quantity>" in revise_payloads[1]
+    assert b"<Name>Color</Name>" in revise_payloads[1]
+    assert b"<Value>44 mm</Value>" in revise_payloads[1]
+    assert [row["api"] for row in results] == ["trading_item", "trading_variation"]
+    assert all(row["status"] == "updated" for row in results)
 
 
 def test_ebay_trading_enrichment_uses_refreshed_seller_token(monkeypatch):

@@ -981,6 +981,32 @@ class EbayClient:
                 "sku": str(update.get("sku") or "").strip(),
                 "item_id": str(update.get("item_id") or "").strip(),
                 "quantity": max(0, int(update.get("quantity") or 0)),
+                **(
+                    {"inventory_tracking": str(update.get("inventory_tracking") or "").strip()}
+                    if update.get("inventory_tracking")
+                    else {}
+                ),
+                **(
+                    {
+                        "variation_specifics": {
+                            str(name): str(value)
+                            for name, value in update.get("variation_specifics", {}).items()
+                            if str(name).strip() and str(value).strip()
+                        }
+                    }
+                    if isinstance(update.get("variation_specifics"), dict)
+                    else {}
+                ),
+                **(
+                    {"start_price": float(update["start_price"])}
+                    if update.get("start_price") is not None
+                    else {}
+                ),
+                **(
+                    {"currency": str(update.get("currency") or "USD").strip() or "USD"}
+                    if update.get("start_price") is not None
+                    else {}
+                ),
             }
             for update in updates
             if str(update.get("sku") or "").strip()
@@ -991,12 +1017,18 @@ class EbayClient:
         results: list[dict[str, Any]] = []
         inventory_api_updates: list[tuple[dict[str, Any], dict[str, Any]]] = []
         trading_updates: list[dict[str, Any]] = []
+        item_id_updates: list[dict[str, Any]] = []
+        variation_specific_updates: list[dict[str, Any]] = []
         async with httpx.AsyncClient(base_url=self.base_url, timeout=45) as client:
             await self._ensure_access_token(client)
             for update in normalized:
                 offer = await self._fetch_offer(client, update["sku"])
                 if offer.get("offerId"):
                     inventory_api_updates.append((update, offer))
+                elif update.get("inventory_tracking") == "variation_specifics":
+                    variation_specific_updates.append(update)
+                elif update.get("inventory_tracking") == "item_id":
+                    item_id_updates.append(update)
                 else:
                     trading_updates.append(update)
 
@@ -1064,6 +1096,31 @@ class EbayClient:
                             "messages": result["messages"],
                         }
                     )
+
+            for update in item_id_updates + variation_specific_updates:
+                request_payload = self._trading_revise_fixed_price_quantity_request(update)
+                response = await self._post_content(
+                    client,
+                    "/ws/api.dll",
+                    content=request_payload,
+                    headers=self._trading_headers("ReviseFixedPriceItem"),
+                )
+                response.raise_for_status()
+                result = self._parse_trading_ack(response.content)
+                results.append(
+                    {
+                        **update,
+                        "status": (
+                            "updated" if result["ack"] in {"Success", "Warning"} else "failed"
+                        ),
+                        "api": (
+                            "trading_variation"
+                            if update.get("inventory_tracking") == "variation_specifics"
+                            else "trading_item"
+                        ),
+                        "messages": result["messages"],
+                    }
+                )
         return results
 
     async def revise_trading_listings(
@@ -1159,29 +1216,56 @@ class EbayClient:
             variations = cls._xml_nested_child(item, "Variations")
             variation_rows = cls._xml_children(variations, "Variation")
             if variation_rows:
-                for variation in variation_rows:
-                    sku = cls._xml_text(variation, "SKU") or ""
-                    if not sku:
-                        continue
+                for index, variation in enumerate(variation_rows, start=1):
+                    seller_sku = cls._xml_text(variation, "SKU") or ""
+                    variation_specifics = cls._xml_name_values(
+                        cls._xml_child(variation, "VariationSpecifics")
+                    )
+                    sku = seller_sku or cls._generated_variation_sku(
+                        item_id,
+                        variation_specifics,
+                        index,
+                    )
                     total = cls._int_value(cls._xml_text(variation, "Quantity"))
                     sold = cls._int_value(
                         cls._xml_nested_text(variation, "SellingStatus", "QuantitySold")
                     )
-                    rows.append(
-                        {
-                            "sku": sku,
-                            "item_id": item_id,
-                            "quantity": max(0, total - sold),
-                        }
-                    )
+                    row: dict[str, Any] = {
+                        "sku": sku,
+                        "item_id": item_id,
+                        "quantity": max(0, total - sold),
+                    }
+                    if not seller_sku:
+                        price_node = cls._xml_child(variation, "StartPrice")
+                        price = cls._float_value(
+                            price_node.text if price_node is not None else None
+                        )
+                        row.update(
+                            {
+                                "inventory_tracking": "variation_specifics",
+                                "variation_specifics": variation_specifics,
+                                "start_price": price,
+                                "currency": (
+                                    price_node.attrib.get("currencyID")
+                                    if price_node is not None
+                                    else None
+                                )
+                                or "USD",
+                            }
+                        )
+                    rows.append(row)
                 continue
 
-            sku = cls._xml_text(item, "SKU") or ""
+            seller_sku = cls._xml_text(item, "SKU") or ""
+            sku = seller_sku or (f"EBAY-{item_id}" if item_id else "")
             if not sku:
                 continue
             total = cls._int_value(cls._xml_text(item, "Quantity"))
             sold = cls._int_value(cls._xml_nested_text(item, "SellingStatus", "QuantitySold"))
-            rows.append({"sku": sku, "item_id": item_id, "quantity": max(0, total - sold)})
+            row = {"sku": sku, "item_id": item_id, "quantity": max(0, total - sold)}
+            if not seller_sku:
+                row["inventory_tracking"] = "item_id"
+            rows.append(row)
         return rows
 
     @staticmethod
@@ -1199,6 +1283,42 @@ class EbayClient:
                 ET.SubElement(status, "ItemID").text = item_id
             ET.SubElement(status, "SKU").text = sku
             ET.SubElement(status, "Quantity").text = str(max(0, int(update.get("quantity") or 0)))
+        ET.SubElement(root, "ErrorLanguage").text = "en_US"
+        ET.SubElement(root, "WarningLevel").text = "High"
+        return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+    @staticmethod
+    def _trading_revise_fixed_price_quantity_request(update: dict[str, Any]) -> bytes:
+        item_id = str(update.get("item_id") or "").strip()
+        if not item_id:
+            raise ValueError("An eBay item ID is required for quantity updates without a seller SKU.")
+
+        root = ET.Element(
+            "ReviseFixedPriceItemRequest",
+            xmlns="urn:ebay:apis:eBLBaseComponents",
+        )
+        item = ET.SubElement(root, "Item")
+        ET.SubElement(item, "ItemID").text = item_id
+        quantity = str(max(0, int(update.get("quantity") or 0)))
+        if update.get("inventory_tracking") == "variation_specifics":
+            specifics = update.get("variation_specifics")
+            if not isinstance(specifics, dict) or not specifics:
+                raise ValueError("Variation specifics are required to update an eBay variation without a SKU.")
+            if update.get("start_price") is None:
+                raise ValueError("Start price is required to update an eBay variation without a SKU.")
+            variations = ET.SubElement(item, "Variations")
+            variation = ET.SubElement(variations, "Variation")
+            start_price = ET.SubElement(variation, "StartPrice")
+            start_price.attrib["currencyID"] = str(update.get("currency") or "USD")
+            start_price.text = f"{float(update['start_price']):.2f}"
+            ET.SubElement(variation, "Quantity").text = quantity
+            variation_specifics = ET.SubElement(variation, "VariationSpecifics")
+            for name, value in specifics.items():
+                pair = ET.SubElement(variation_specifics, "NameValueList")
+                ET.SubElement(pair, "Name").text = str(name)
+                ET.SubElement(pair, "Value").text = str(value)
+        else:
+            ET.SubElement(item, "Quantity").text = quantity
         ET.SubElement(root, "ErrorLanguage").text = "en_US"
         ET.SubElement(root, "WarningLevel").text = "High"
         return ET.tostring(root, encoding="utf-8", xml_declaration=True)

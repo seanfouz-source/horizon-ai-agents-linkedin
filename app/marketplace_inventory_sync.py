@@ -116,6 +116,24 @@ class MarketplaceInventorySyncer:
                 "sku": str(row["sku"]),
                 "item_id": str(row.get("item_id") or ""),
                 "quantity": max(0, int(row.get("quantity") or 0)),
+                **(
+                    {"inventory_tracking": row["inventory_tracking"]}
+                    if row.get("inventory_tracking")
+                    else {}
+                ),
+                **(
+                    {"variation_specifics": row["variation_specifics"]}
+                    if isinstance(row.get("variation_specifics"), dict)
+                    else {}
+                ),
+                **(
+                    {
+                        "start_price": row["start_price"],
+                        "currency": row.get("currency") or "USD",
+                    }
+                    if row.get("start_price") is not None
+                    else {}
+                ),
             }
             for row in ebay_rows
             if str(row.get("sku") or "").strip()
@@ -173,6 +191,24 @@ class MarketplaceInventorySyncer:
                 "sku": sku,
                 "item_id": ebay_by_sku[sku]["item_id"],
                 "quantity": plan.target_quantity,
+                **(
+                    {"inventory_tracking": ebay_by_sku[sku]["inventory_tracking"]}
+                    if ebay_by_sku[sku].get("inventory_tracking")
+                    else {}
+                ),
+                **(
+                    {"variation_specifics": ebay_by_sku[sku]["variation_specifics"]}
+                    if isinstance(ebay_by_sku[sku].get("variation_specifics"), dict)
+                    else {}
+                ),
+                **(
+                    {
+                        "start_price": ebay_by_sku[sku]["start_price"],
+                        "currency": ebay_by_sku[sku].get("currency") or "USD",
+                    }
+                    if ebay_by_sku[sku].get("start_price") is not None
+                    else {}
+                ),
             }
             for sku, plan in plans.items()
             if plan.update_ebay
