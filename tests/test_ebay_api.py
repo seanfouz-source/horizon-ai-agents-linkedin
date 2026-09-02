@@ -354,6 +354,45 @@ def test_ebay_lightweight_inventory_parser_includes_variations():
     ]
 
 
+def test_ebay_lightweight_inventory_parser_includes_prices_for_seller_skus():
+    payload = b"""<?xml version="1.0" encoding="utf-8"?>
+    <GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">
+      <Ack>Success</Ack>
+      <ActiveList><ItemArray>
+        <Item>
+          <ItemID>123</ItemID><SKU>PHONE-1</SKU>
+          <StartPrice currencyID="USD">499.99</StartPrice><Quantity>1</Quantity>
+        </Item>
+        <Item>
+          <ItemID>456</ItemID><Variations>
+            <Variation><SKU>WATCH-BLACK</SKU>
+              <StartPrice currencyID="USD">299.95</StartPrice><Quantity>2</Quantity>
+            </Variation>
+          </Variations>
+        </Item>
+      </ItemArray></ActiveList>
+    </GetMyeBaySellingResponse>"""
+
+    rows = EbayClient._parse_trading_active_inventory(payload)
+
+    assert rows == [
+        {
+            "sku": "PHONE-1",
+            "item_id": "123",
+            "quantity": 1,
+            "start_price": 499.99,
+            "currency": "USD",
+        },
+        {
+            "sku": "WATCH-BLACK",
+            "item_id": "456",
+            "quantity": 2,
+            "start_price": 299.95,
+            "currency": "USD",
+        },
+    ]
+
+
 def test_ebay_lightweight_inventory_parser_includes_current_images():
     payload = b"""<?xml version="1.0" encoding="utf-8"?>
     <GetMyeBaySellingResponse xmlns="urn:ebay:apis:eBLBaseComponents">

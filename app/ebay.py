@@ -1257,6 +1257,15 @@ class EbayClient:
             parent_images = cls._dedupe_urls(
                 parent_picture_urls + ([gallery_url] if gallery_url else [])
             )
+            item_price_node = cls._xml_child(item, "StartPrice")
+            item_price = cls._float_value(
+                item_price_node.text if item_price_node is not None else None
+            )
+            item_currency = (
+                item_price_node.attrib.get("currencyID")
+                if item_price_node is not None
+                else None
+            ) or "USD"
             if variation_rows:
                 picture_map = cls._xml_variation_picture_map(variations)
                 for index, variation in enumerate(variation_rows, start=1):
@@ -1278,6 +1287,19 @@ class EbayClient:
                         "item_id": item_id,
                         "quantity": max(0, total - sold),
                     }
+                    price_node = cls._xml_child(variation, "StartPrice")
+                    price = cls._float_value(
+                        price_node.text if price_node is not None else None
+                    )
+                    if price is None:
+                        price = item_price
+                    if price is not None:
+                        row["start_price"] = price
+                        row["currency"] = (
+                            price_node.attrib.get("currencyID")
+                            if price_node is not None
+                            else item_currency
+                        ) or "USD"
                     image_urls = cls._dedupe_urls(
                         cls._variation_images(variation_specifics, picture_map)
                         + parent_images
@@ -1289,21 +1311,10 @@ class EbayClient:
                             or cls._variation_images(variation_specifics, picture_map)
                         )
                     if not seller_sku:
-                        price_node = cls._xml_child(variation, "StartPrice")
-                        price = cls._float_value(
-                            price_node.text if price_node is not None else None
-                        )
                         row.update(
                             {
                                 "inventory_tracking": "variation_specifics",
                                 "variation_specifics": variation_specifics,
-                                "start_price": price,
-                                "currency": (
-                                    price_node.attrib.get("currencyID")
-                                    if price_node is not None
-                                    else None
-                                )
-                                or "USD",
                             }
                         )
                     rows.append(row)
@@ -1316,6 +1327,9 @@ class EbayClient:
             total = cls._int_value(cls._xml_text(item, "Quantity"))
             sold = cls._int_value(cls._xml_nested_text(item, "SellingStatus", "QuantitySold"))
             row = {"sku": sku, "item_id": item_id, "quantity": max(0, total - sold)}
+            if item_price is not None:
+                row["start_price"] = item_price
+                row["currency"] = item_currency
             if parent_images:
                 row["image_urls"] = parent_images
                 row["image_complete"] = bool(parent_picture_urls)
