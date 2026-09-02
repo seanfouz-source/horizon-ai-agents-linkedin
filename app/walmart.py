@@ -191,15 +191,23 @@ class WalmartMarketplaceClient:
         return self._json_object(response)
 
     async def list_published_items(self, *, limit: int = 1000) -> list[dict[str, Any]]:
-        response = await self._request(
-            "GET",
-            "/v3/items",
-            params={
-                "publishedStatus": "PUBLISHED",
-                "lifecycleStatus": "ACTIVE",
-                "limit": max(1, min(limit, 1000)),
-            },
-        )
+        try:
+            response = await self._request(
+                "GET",
+                "/v3/items",
+                params={
+                    "publishedStatus": "PUBLISHED",
+                    "lifecycleStatus": "ACTIVE",
+                    "limit": max(1, min(limit, 1000)),
+                },
+            )
+        except WalmartApiError as exc:
+            # Newly approved sellers can receive a 404 while their catalog is
+            # still empty. Treat that response as an empty published catalog;
+            # once Walmart has a published item, this endpoint returns its SKU.
+            if exc.status_code == 404:
+                return []
+            raise
         payload = self._json_object(response)
         raw_items = payload.get("ItemResponse") or payload.get("items") or []
         if isinstance(raw_items, dict):

@@ -402,3 +402,23 @@ def test_walmart_client_reads_published_items_and_inventory(monkeypatch):
         }
     ]
     assert quantity == 4
+
+
+def test_walmart_client_treats_not_found_items_catalog_as_empty(monkeypatch):
+    def handler(method, path, headers, **kwargs):
+        request = httpx.Request(method, f"https://marketplace.walmartapis.com{path}", headers=headers)
+        if path == "/v3/token":
+            return httpx.Response(200, json={"access_token": "access-token"}, request=request)
+        if path == "/v3/items":
+            return httpx.Response(404, json={"message": "No items found"}, request=request)
+        raise AssertionError(f"Unexpected Walmart request: {method} {path}")
+
+    monkeypatch.setattr(
+        walmart_module.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: FakeAsyncClient(handler, *args, **kwargs),
+    )
+
+    items = asyncio.run(WalmartMarketplaceClient(_settings()).list_published_items())
+
+    assert items == []
