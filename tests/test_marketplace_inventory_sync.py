@@ -224,14 +224,7 @@ class FakeWalmartClient:
             walmart_auto_publish_excluded_terms="don toliver,don oliver,otterbox",
         )
         self.quantities = {"PHONE-LIVE": 2, "PHONE-ENDED": 1}
-        self.inventory_payloads = []
-        self.image_payloads = []
-        self.price_updates = []
-        self.feed_status = {"feedStatus": "RECEIVED"}
-
-    async def list_published_items(self, *, limit):
-        assert limit == 1000
-        return [
+        self.published_items = [
             {
                 "sku": "PHONE-LIVE",
                 "published_status": "PUBLISHED",
@@ -249,6 +242,14 @@ class FakeWalmartClient:
                 "product_id": "00123456789029",
             },
         ]
+        self.inventory_payloads = []
+        self.image_payloads = []
+        self.price_updates = []
+        self.feed_status = {"feedStatus": "RECEIVED"}
+
+    async def list_published_items(self, *, limit):
+        assert limit == 1000
+        return self.published_items
 
     async def get_inventory_quantity(self, sku):
         return self.quantities[sku]
@@ -418,3 +419,96 @@ def test_syncer_zeroes_excluded_walmart_item_without_reducing_ebay(tmp_path):
 
     assert second["updated_walmart"] == 0
     assert len(walmart.inventory_payloads) == 1
+
+
+def _live_listing_repository(tmp_path):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    repository.upsert_items(
+        [
+            InventoryItem(
+                sku="PHONE-LIVE",
+                title="Live phone",
+                quantity=2,
+                source="ebay-api",
+            )
+        ]
+    )
+    repository.upsert_walmart_drafts(
+        [
+            {
+                "sku": "PHONE-LIVE",
+                "ebay_item_id": "100",
+                "prepared_listing": {
+                    "images": [
+                        "https://i.ebayimg.com/images/g/new-main/s-l1600.jpg",
+                        "https://i.ebayimg.com/images/g/new-back/s-l1600.jpg",
+                    ]
+                },
+            }
+        ]
+    )
+    return repository
+
+
+def test_unpublished_walmart_draft_cannot_change_ebay(tmp_path):
+    repository = _live_listing_repository(tmp_path)
+    ebay = FakeEbayClient()
+    walmart = FakeWalmartClient()
+    walmart.published_items = []
+    walmart.quantities = {}
+
+    result = asyncio.run(MarketplaceInventorySyncer(repository, ebay, walmart).sync_once())
+
+    assert result["status"] == "no_published_matches"
+    assert result["checked"] == 0
+    assert ebay.revisions == []
+    assert walmart.inventory_payloads == []
+    assert walmart.price_updates == []
+    assert walmart.image_payloads == []
+
+
+def test_first_walmart_publication_uses_ebay_quantity_without_changing_ebay(tmp_path):
+    repository = _live_listing_repository(tmp_path)
+    ebay = FakeEbayClient()
+    walmart = FakeWalmartClient()
+    walmart.published_items = walmart.published_items[:1]
+    walmart.quantities = {"PHONE-LIVE": 1}
+
+    result = asyncio.run(MarketplaceInventorySyncer(repository, ebay, walmart).sync_once())
+
+    assert result["updated_ebay"] == 0
+    assert result["updated_walmart"] == 1
+    assert ebay.revisions == []
+    assert walmart.inventory_payloads[0]["Inventory"][0]["quantity"]["amount"] == 2
+    assert repository.marketplace_inventory_sync_state("PHONE-LIVE")["last_source"] == (
+        "ebay_initial"
+    )
+
+
+def test_later_walmart_sale_reduces_ebay_through_client_call(tmp_path):
+    repository = _live_listing_repository(tmp_path)
+    repository.upsert_marketplace_inventory_sync_state(
+        sku="PHONE-LIVE",
+        ebay_item_id="100",
+        ebay_quantity=2,
+        walmart_quantity=2,
+        synced_quantity=2,
+        quantity_policy_version=2,
+        last_source="already_equal",
+        status="synced",
+    )
+    ebay = FakeEbayClient()
+    walmart = FakeWalmartClient()
+    walmart.published_items = walmart.published_items[:1]
+    walmart.quantities = {"PHONE-LIVE": 1}
+
+    result = asyncio.run(MarketplaceInventorySyncer(repository, ebay, walmart).sync_once())
+
+    assert result["updated_ebay"] == 1
+    assert result["updated_walmart"] == 0
+    assert ebay.revisions[0]["sku"] == "PHONE-LIVE"
+    assert ebay.revisions[0]["quantity"] == 1
+    assert walmart.inventory_payloads == []
+    assert repository.marketplace_inventory_sync_state("PHONE-LIVE")["last_source"] == (
+        "walmart_sale"
+    )
