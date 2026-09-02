@@ -59,6 +59,12 @@ def choose_inventory_sync_plan(
         if walmart_quantity == pending_quantity:
             pending_quantity = None
             pending_at = None
+        elif walmart_quantity < min(pending_quantity, synced_quantity):
+            # A Walmart sale can land while our own Walmart quantity feed is still
+            # processing.  Do not hide that real inventory decrease behind the
+            # normal feed grace period.
+            pending_quantity = None
+            pending_at = None
         elif ebay_quantity == synced_quantity and pending_at is not None:
             age_seconds = (current_time - pending_at).total_seconds()
             if age_seconds < WALMART_FEED_GRACE_SECONDS:
@@ -86,16 +92,18 @@ def choose_inventory_sync_plan(
         )
 
     ebay_changed = ebay_quantity != synced_quantity
-    walmart_changed = walmart_quantity != synced_quantity
-    if ebay_changed and not walmart_changed:
-        target = ebay_quantity
-        source = "ebay"
-    elif walmart_changed and not ebay_changed:
+    walmart_decreased = walmart_quantity < synced_quantity
+    if walmart_decreased and not ebay_changed:
         target = walmart_quantity
-        source = "walmart"
-    else:
+        source = "walmart_sale"
+    elif walmart_decreased:
         target = min(ebay_quantity, walmart_quantity)
         source = "safety_minimum"
+    else:
+        # eBay owns the inventory ceiling. A Walmart increase is treated as a
+        # manual/stale edit and is overwritten instead of inflating eBay stock.
+        target = ebay_quantity
+        source = "ebay" if ebay_changed else "ebay_authoritative"
 
     return InventorySyncPlan(
         target_quantity=target,
@@ -197,6 +205,19 @@ class MarketplaceInventorySyncer:
             for row in self.repository.walmart_drafts(skus=walmart_skus, limit=200)
             if str(row.get("sku") or "").strip()
         }
+        ebay_items_by_sku = {
+            item.sku: item
+            for item in self.repository.ebay_items(
+                skus=walmart_skus,
+                limit=200,
+                include_inactive=True,
+            )
+        }
+        excluded_skus = {
+            sku: term
+            for sku, item in ebay_items_by_sku.items()
+            if (term := self._walmart_exclusion(item)) is not None
+        }
         common_skus = sorted(set(ebay_by_sku) & walmart_skus)
         ended_skus = sorted((walmart_skus & set(draft_by_sku)) - set(ebay_by_sku))
         sync_skus = sorted(set(common_skus) | set(ended_skus))
@@ -245,7 +266,21 @@ class MarketplaceInventorySyncer:
         }
         plans: dict[str, InventorySyncPlan] = {}
         for sku, walmart_quantity_value in walmart_by_sku.items():
-            if sku in ebay_by_sku:
+            if sku in excluded_skus:
+                zero_plan = choose_ended_listing_sync_plan(
+                    walmart_quantity_value,
+                    states[sku],
+                    now=attempted_at,
+                )
+                plans[sku] = InventorySyncPlan(
+                    target_quantity=zero_plan.target_quantity,
+                    source=f"excluded:{excluded_skus[sku]}",
+                    update_ebay=False,
+                    update_walmart=zero_plan.update_walmart,
+                    pending_walmart_quantity=zero_plan.pending_walmart_quantity,
+                    pending_walmart_at=zero_plan.pending_walmart_at,
+                )
+            elif sku in ebay_by_sku:
                 plans[sku] = choose_inventory_sync_plan(
                     ebay_by_sku[sku]["quantity"],
                     walmart_quantity_value,
@@ -267,6 +302,8 @@ class MarketplaceInventorySyncer:
         price_candidates: dict[str, tuple[float, float, str]] = {}
         price_errors: dict[str, str] = {}
         for sku in common_skus:
+            if sku in excluded_skus:
+                continue
             source_price = ebay_by_sku[sku].get("start_price")
             if source_price is None:
                 continue
@@ -419,6 +456,8 @@ class MarketplaceInventorySyncer:
 
         image_refresh_item_ids: set[str] = set()
         for sku in common_skus:
+            if sku in excluded_skus:
+                continue
             if sku not in image_states or sku not in plans:
                 continue
             source_row = ebay_by_sku[sku]
@@ -462,6 +501,8 @@ class MarketplaceInventorySyncer:
             if str(row.get("sku") or "").strip()
         }
         for sku in common_skus:
+            if sku in excluded_skus:
+                continue
             if sku not in image_states or sku not in plans:
                 continue
             item_id = ebay_by_sku[sku]["item_id"]
@@ -506,6 +547,8 @@ class MarketplaceInventorySyncer:
         )
         image_candidates: dict[str, list[str]] = {}
         for sku in common_skus:
+            if sku in excluded_skus:
+                continue
             if sku not in image_states or sku not in plans:
                 continue
             images = ebay_by_sku[sku]["image_urls"]
@@ -774,10 +817,11 @@ class MarketplaceInventorySyncer:
             "updated_ebay": len(ebay_updates) - len(failed_ebay_skus),
             "updated_walmart": len(walmart_update_skus) if walmart_submission else 0,
             "zeroed_walmart": (
-                len(set(walmart_update_skus) & set(ended_skus))
+                len(set(walmart_update_skus) & (set(ended_skus) | set(excluded_skus)))
                 if walmart_submission
                 else 0
             ),
+            "excluded_walmart_skus": len(set(sync_skus) & set(excluded_skus)),
             "updated_prices": len(updated_price_skus),
             "price_markup_percent": price_markup_percent,
             "image_updates_submitted": len(maintenance_skus) if image_submission else 0,
@@ -787,6 +831,29 @@ class MarketplaceInventorySyncer:
             "errors": all_errors,
             "last_attempt_at": now_iso,
         }
+
+    def _walmart_exclusion(self, item: InventoryItem) -> str | None:
+        terms = [
+            term.strip().lower()
+            for term in str(
+                getattr(
+                    self.walmart_client.settings,
+                    "walmart_auto_publish_excluded_terms",
+                    "don toliver,don oliver,otterbox",
+                )
+                or ""
+            ).split(",")
+            if term.strip()
+        ]
+        searchable = " ".join(
+            (
+                item.title or "",
+                item.description or "",
+                item.category or "",
+                " ".join(str(value or "") for value in item.item_specifics.values()),
+            )
+        ).lower()
+        return next((term for term in terms if term in searchable), None)
 
 
 def _normalized_image_urls(value: object) -> list[str]:

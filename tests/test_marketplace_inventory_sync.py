@@ -43,9 +43,18 @@ def test_walmart_change_flows_to_ebay():
     plan = choose_inventory_sync_plan(5, 4, _state(5))
 
     assert plan.target_quantity == 4
-    assert plan.source == "walmart"
+    assert plan.source == "walmart_sale"
     assert plan.update_ebay is True
     assert plan.update_walmart is False
+
+
+def test_walmart_increase_is_overwritten_from_ebay():
+    plan = choose_inventory_sync_plan(5, 7, _state(5))
+
+    assert plan.target_quantity == 5
+    assert plan.source == "ebay_authoritative"
+    assert plan.update_ebay is False
+    assert plan.update_walmart is True
 
 
 def test_conflicting_changes_choose_lower_quantity_to_avoid_overselling():
@@ -55,6 +64,15 @@ def test_conflicting_changes_choose_lower_quantity_to_avoid_overselling():
     assert plan.source == "safety_minimum"
     assert plan.update_ebay is True
     assert plan.update_walmart is False
+
+
+def test_ebay_decrease_wins_when_walmart_was_increased():
+    plan = choose_inventory_sync_plan(4, 6, _state(5))
+
+    assert plan.target_quantity == 4
+    assert plan.source == "ebay"
+    assert plan.update_ebay is False
+    assert plan.update_walmart is True
 
 
 def test_pending_walmart_feed_is_not_mistaken_for_a_manual_change():
@@ -74,6 +92,25 @@ def test_pending_walmart_feed_is_not_mistaken_for_a_manual_change():
     assert plan.update_ebay is False
     assert plan.update_walmart is False
     assert plan.pending_walmart_quantity == 3
+
+
+def test_walmart_sale_during_pending_feed_still_reduces_ebay():
+    now = datetime.now(timezone.utc)
+    plan = choose_inventory_sync_plan(
+        5,
+        4,
+        _state(
+            5,
+            pending_walmart_quantity=6,
+            pending_walmart_at=(now - timedelta(minutes=1)).isoformat(),
+        ),
+        now=now,
+    )
+
+    assert plan.target_quantity == 4
+    assert plan.source == "walmart_sale"
+    assert plan.update_ebay is True
+    assert plan.update_walmart is False
 
 
 def test_ended_ebay_listing_drives_walmart_to_zero():
@@ -164,6 +201,7 @@ class FakeWalmartClient:
         self.settings = SimpleNamespace(
             walmart_maintenance_spec_version="5.0.20260608-18_15_07-api",
             walmart_price_markup_percent=10.0,
+            walmart_auto_publish_excluded_terms="don toliver,don oliver,otterbox",
         )
         self.quantities = {"PHONE-LIVE": 2, "PHONE-ENDED": 1}
         self.inventory_payloads = []
@@ -313,3 +351,50 @@ def test_syncer_updates_changed_images_and_zeroes_ended_listing(tmp_path):
     live_state = repository.marketplace_inventory_sync_state("PHONE-LIVE")
     assert live_state["ebay_price"] == 120.0
     assert live_state["synced_walmart_price"] == 132.0
+
+
+def test_syncer_zeroes_excluded_walmart_item_without_reducing_ebay(tmp_path):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    repository.upsert_items(
+        [
+            InventoryItem(
+                sku="PHONE-LIVE",
+                title="OtterBox phone case",
+                quantity=2,
+                source="ebay-api",
+            )
+        ]
+    )
+    repository.upsert_walmart_drafts(
+        [
+            {
+                "sku": "PHONE-LIVE",
+                "ebay_item_id": "100",
+                "prepared_listing": {
+                    "images": [
+                        "https://i.ebayimg.com/images/g/old-main/s-l1600.jpg"
+                    ]
+                },
+            }
+        ]
+    )
+    ebay = FakeEbayClient()
+    walmart = FakeWalmartClient()
+    walmart.quantities = {"PHONE-LIVE": 2}
+
+    result = asyncio.run(MarketplaceInventorySyncer(repository, ebay, walmart).sync_once())
+
+    assert result["excluded_walmart_skus"] == 1
+    assert result["zeroed_walmart"] == 1
+    assert ebay.revisions == []
+    assert walmart.price_updates == []
+    assert walmart.image_payloads == []
+    assert walmart.inventory_payloads[0]["Inventory"][0]["quantity"]["amount"] == 0
+    assert repository.marketplace_inventory_sync_state("PHONE-LIVE")["last_source"] == (
+        "excluded:otterbox"
+    )
+
+    second = asyncio.run(MarketplaceInventorySyncer(repository, ebay, walmart).sync_once())
+
+    assert second["updated_walmart"] == 0
+    assert len(walmart.inventory_payloads) == 1
