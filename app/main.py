@@ -2627,6 +2627,30 @@ async def walmart_status(
     return status
 
 
+@app.get("/walmart/catalog/items")
+async def walmart_catalog_items(
+    request: Request,
+    published_status: str | None = None,
+    lifecycle_status: str | None = None,
+    limit: int = 1000,
+    x_horizon_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_secret(x_horizon_secret, request.query_params.get("secret"))
+    if not walmart_client.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="WALMART_CLIENT_ID and WALMART_CLIENT_SECRET are not configured.",
+        )
+    try:
+        return await walmart_client.list_catalog_items(
+            published_status=published_status,
+            lifecycle_status=lifecycle_status,
+            limit=limit,
+        )
+    except WalmartApiError as exc:
+        raise _walmart_http_error(exc) from exc
+
+
 @app.get("/walmart/drafts/summary")
 def walmart_drafts_summary() -> dict[str, Any]:
     return {

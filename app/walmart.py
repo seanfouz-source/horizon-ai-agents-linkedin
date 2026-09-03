@@ -324,6 +324,21 @@ class WalmartMarketplaceClient:
             and (summary := _published_item_summary(item)) is not None
         ]
 
+    async def list_catalog_items(
+        self,
+        *,
+        published_status: str | None = None,
+        lifecycle_status: str | None = None,
+        limit: int = 1000,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"limit": max(1, min(limit, 1000))}
+        if str(published_status or "").strip():
+            params["publishedStatus"] = str(published_status).strip().upper()
+        if str(lifecycle_status or "").strip():
+            params["lifecycleStatus"] = str(lifecycle_status).strip().upper()
+        response = await self._request("GET", "/v3/items", params=params)
+        return self._json_object(response)
+
     async def get_item_details(self, sku: str) -> dict[str, Any]:
         clean_sku = str(sku or "").strip()
         if not clean_sku:
