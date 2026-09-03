@@ -469,6 +469,48 @@ def test_online_identifier_lookup_is_walmart_verified_and_cached(monkeypatch, tm
     assert cached["lookup_attempts"] == 1
 
 
+def test_cached_full_item_required_identifier_is_rechecked_without_waiting(
+    monkeypatch, tmp_path
+):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    item = InventoryItem(
+        sku="EBAY-FULL-CACHE",
+        title="JBL Go 4 Red Portable Speaker Open Box",
+        condition="Open box",
+        price=55,
+        quantity=1,
+        image_url="https://example.com/speaker.jpg",
+        item_specifics={"Brand": "JBL", "Model": "Go 4"},
+    )
+    repository.upsert_walmart_product_identifier_cache(
+        item.sku,
+        source_fingerprint=main_module.product_identifier_fingerprint(item),
+        verification_status="full_item_required",
+        product_id_type="UPC",
+        product_id="050036399296",
+        next_lookup_at=(datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
+    )
+
+    class LookupMustNotRun:
+        configured = True
+
+        async def lookup(self, item, candidates):
+            raise AssertionError("The cached identifier should be reused before online research.")
+
+    monkeypatch.setattr(main_module, "repository", repository)
+    monkeypatch.setattr(main_module, "product_identifier_lookup", LookupMustNotRun())
+
+    product_id_type, product_id, result = asyncio.run(
+        main_module._resolve_online_product_identifier(
+            item, [], main_module._WalmartGtinLookupBudget(0)
+        )
+    )
+
+    assert product_id_type == "UPC"
+    assert product_id == "050036399296"
+    assert result["status"] == "full_item_template_cache"
+
+
 def test_condition_specific_walmart_upc_is_replaced_with_original_identifier(
     monkeypatch, tmp_path
 ):

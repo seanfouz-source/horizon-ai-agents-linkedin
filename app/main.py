@@ -1007,10 +1007,19 @@ async def _resolve_online_product_identifier(
         product_id_type, product_id = normalize_product_identifier(
             cached.get("product_id_type"), cached.get("product_id")
         )
-        if cached.get("verification_status") in {"verified", "full_item_template"} and product_id_type and product_id:
+        cached_status = str(cached.get("verification_status") or "")
+        if (
+            cached_status in {"verified", "full_item_required", "full_item_template"}
+            and product_id_type
+            and product_id
+        ):
             await budget.record("cache_hit")
             return product_id_type, product_id, {
-                "status": "verified_cache",
+                "status": (
+                    "full_item_template_cache"
+                    if cached_status in {"full_item_required", "full_item_template"}
+                    else "verified_cache"
+                ),
                 "source_urls": cached.get("source_urls") or [],
                 "matched_product": cached.get("matched_product"),
             }
@@ -1786,6 +1795,8 @@ async def _run_walmart_auto_publish_once(
             "resolved": resolution_results,
             "gtin_lookup": gtin_lookup_budget.summary(),
             "ready_skus": ready_skus,
+            "match_ready_skus": (preflight or {}).get("match_ready_skus", []),
+            "full_item_ready_skus": (preflight or {}).get("full_item_ready_skus", []),
             "blocked_items": (preflight or {}).get("blocked", 0),
             "ebay_sync": ebay_refresh,
             "reconciliation": reconciliation,
