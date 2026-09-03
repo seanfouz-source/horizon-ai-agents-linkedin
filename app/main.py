@@ -180,6 +180,8 @@ LISTING_PHOTO_FILENAMES = {
     "PHOTO-2026-07-24-13-19-13.jpg",
     "PHOTO-2026-07-24-13-19-38.jpg",
 }
+WALMART_OPEN_BOX_RETRY_MARKER = "walmart-open-box-publish-2026-09-02-v1"
+WALMART_OPEN_BOX_RETRY_DELAY_SECONDS = 60
 
 
 def verify_secret(x_horizon_secret: str | None, query_secret: str | None = None) -> None:
@@ -377,6 +379,7 @@ async def startup_inventory_sync() -> None:
     if settings.marketplace_inventory_sync_enabled:
         asyncio.create_task(_marketplace_inventory_sync_loop())
     if settings.walmart_auto_publish_enabled and walmart_client.configured:
+        asyncio.create_task(_startup_walmart_open_box_retry())
         asyncio.create_task(_walmart_auto_publish_loop())
 
 
@@ -465,6 +468,51 @@ async def _walmart_auto_publish_loop() -> None:
         except Exception as exc:
             logger.warning("Walmart automatic draft publishing failed: %s", exc)
         await asyncio.sleep(interval)
+
+
+async def _startup_walmart_open_box_retry() -> None:
+    if WALMART_OPEN_BOX_RETRY_DELAY_SECONDS:
+        await asyncio.sleep(WALMART_OPEN_BOX_RETRY_DELAY_SECONDS)
+    previous = repository.service_run_marker(WALMART_OPEN_BOX_RETRY_MARKER)
+    if previous and previous.get("status") == "complete":
+        return
+    repository.upsert_service_run_marker(
+        WALMART_OPEN_BOX_RETRY_MARKER,
+        status="running",
+    )
+    try:
+        result = await _run_walmart_auto_publish_once(
+            WalmartAutoPublishRequest(
+                max_items=max(1, min(int(settings.walmart_auto_publish_batch_size), 200)),
+                sync_ebay_first=False,
+                confirm=True,
+                force_retry=True,
+            )
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        repository.upsert_service_run_marker(
+            WALMART_OPEN_BOX_RETRY_MARKER,
+            status="failed",
+            result={"message": str(exc)},
+        )
+        logger.warning("One-time Walmart Open Box publishing retry failed: %s", exc)
+        return
+    repository.upsert_service_run_marker(
+        WALMART_OPEN_BOX_RETRY_MARKER,
+        status="complete",
+        result={
+            key: result.get(key)
+            for key in (
+                "status",
+                "submitted_items",
+                "offer_feed_id",
+                "inventory_feed_id",
+                "message",
+            )
+        },
+    )
 
 
 async def _run_marketplace_inventory_sync_once() -> dict[str, Any]:

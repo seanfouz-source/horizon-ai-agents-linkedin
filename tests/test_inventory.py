@@ -235,3 +235,21 @@ def test_walmart_unpublished_job_is_persistent_and_idempotent(tmp_path):
     assert second["offer_feed_id"] == "OFFER-FEED"
     assert second["inventory_feed_id"] == "INVENTORY-FEED"
     assert repository.latest_walmart_unpublished_job() == second
+
+
+def test_service_run_marker_is_persistent_and_updates_result(tmp_path):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+
+    assert repository.service_run_marker("open-box-retry") is None
+    running = repository.upsert_service_run_marker(
+        "open-box-retry", status="running"
+    )
+    completed = repository.upsert_service_run_marker(
+        "open-box-retry",
+        status="complete",
+        result={"submitted_items": 7},
+    )
+
+    assert running["status"] == "running"
+    assert completed["status"] == "complete"
+    assert completed["result"] == {"submitted_items": 7}

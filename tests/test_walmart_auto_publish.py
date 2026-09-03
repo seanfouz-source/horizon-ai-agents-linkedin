@@ -46,6 +46,37 @@ class FakeWalmartClient:
         }
 
 
+def test_startup_open_box_retry_runs_once_without_refreshing_ebay(
+    monkeypatch, tmp_path
+):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    requests = []
+
+    async def fake_publish(request):
+        requests.append(request)
+        return {
+            "status": "submitted",
+            "submitted_items": 4,
+            "offer_feed_id": "OFFER-OPEN-BOX",
+            "inventory_feed_id": "INVENTORY-OPEN-BOX",
+        }
+
+    monkeypatch.setattr(main_module, "repository", repository)
+    monkeypatch.setattr(main_module, "_run_walmart_auto_publish_once", fake_publish)
+    monkeypatch.setattr(main_module, "WALMART_OPEN_BOX_RETRY_DELAY_SECONDS", 0)
+
+    asyncio.run(main_module._startup_walmart_open_box_retry())
+    asyncio.run(main_module._startup_walmart_open_box_retry())
+
+    assert len(requests) == 1
+    assert requests[0].confirm is True
+    assert requests[0].force_retry is True
+    assert requests[0].sync_ebay_first is False
+    marker = repository.service_run_marker(main_module.WALMART_OPEN_BOX_RETRY_MARKER)
+    assert marker["status"] == "complete"
+    assert marker["result"]["submitted_items"] == 4
+
+
 def test_auto_publish_previews_submits_current_inventory_and_does_not_repeat(
     monkeypatch, tmp_path
 ):

@@ -135,6 +135,16 @@ CREATE TABLE IF NOT EXISTS walmart_unpublished_jobs (
 CREATE INDEX IF NOT EXISTS idx_walmart_unpublished_jobs_status
 ON walmart_unpublished_jobs(status);
 
+CREATE TABLE IF NOT EXISTS service_run_markers (
+    marker TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    result TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_service_run_markers_status
+ON service_run_markers(status);
+
 CREATE TABLE IF NOT EXISTS marketplace_inventory_sync_state (
     sku TEXT PRIMARY KEY,
     ebay_item_id TEXT,
@@ -818,6 +828,57 @@ class InventoryRepository:
                 """
             ).fetchone()
         return self._walmart_job_from_row(row) if row else None
+
+    def service_run_marker(self, marker: str) -> dict[str, Any] | None:
+        clean_marker = str(marker or "").strip()
+        if not clean_marker:
+            return None
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM service_run_markers WHERE marker = ?",
+                (clean_marker,),
+            ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        try:
+            result["result"] = json.loads(result.get("result") or "{}")
+        except (TypeError, ValueError):
+            result["result"] = {}
+        return result
+
+    def upsert_service_run_marker(
+        self,
+        marker: str,
+        *,
+        status: str,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        clean_marker = str(marker or "").strip()
+        if not clean_marker:
+            raise ValueError("A service run marker is required.")
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO service_run_markers (
+                    marker, status, result, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(marker) DO UPDATE SET
+                    status = excluded.status,
+                    result = excluded.result,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    clean_marker,
+                    str(status),
+                    json.dumps(result or {}, sort_keys=True),
+                    now,
+                    now,
+                ),
+            )
+        return self.service_run_marker(clean_marker) or {}
 
     def update_inventory_quantity(self, sku: str, quantity: int) -> bool:
         with self.connect() as connection:
