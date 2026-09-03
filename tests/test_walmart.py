@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import httpx
+import pytest
 
 import app.walmart as walmart_module
 from app.models import InventoryItem, WalmartItemOverride
@@ -168,11 +169,8 @@ def test_full_item_builder_uses_walmart_spec_template_and_ebay_offer_data():
     assert orderable["electronicsIndicator"] == "Yes"
     assert orderable["productIdentifiers"]["productIdType"] == "GTIN"
     assert visible["condition"] == "Open Box"
-    assert visible["mainImageUrl"] == item.image_url
-    assert visible["productSecondaryImageURL"] == [
-        item.image_urls[1],
-        "https://i5.walmartimages.com/catalog.jpg",
-    ]
+    assert visible["mainImageUrl"] == "https://i5.walmartimages.com/catalog.jpg"
+    assert "productSecondaryImageURL" not in visible
     assert visible["has_written_warranty"] == "No"
 
 
@@ -235,7 +233,7 @@ def test_offer_match_builder_preserves_walmart_template_identifier_and_category(
     assert offer["price"] == 423.5
     assert offer["ShippingWeight"] == 2.0
     assert offer["condition"] == "Open Box"
-    assert offer["mainImageUrl"] == item.image_url
+    assert "mainImageUrl" not in offer
 
 
 def test_offer_match_builder_can_omit_catalog_content_for_repair_feed():
@@ -342,10 +340,14 @@ def test_offer_match_preview_accepts_per_sku_overrides():
 
     assert preview["ready"] == 1
     assert preview["items"][0]["resolved"]["condition"] == "Pre-Owned: Good"
-    assert preview["payload"]["MPItem"][0]["Item"]["mainImageUrl"] == item.image_url
+    assert "mainImageUrl" not in preview["payload"]["MPItem"][0]["Item"]
+    assert any(
+        "non-Walmart image URL was omitted" in warning
+        for warning in preview["items"][0]["warnings"]
+    )
 
 
-def test_offer_match_preview_blocks_required_image_over_url_limit():
+def test_offer_match_preview_omits_non_walmart_image_and_uses_catalog_stock():
     item = InventoryItem(
         sku="EBAY-123",
         title="Pre-owned phone",
@@ -358,8 +360,12 @@ def test_offer_match_preview_blocks_required_image_over_url_limit():
 
     preview = build_offer_match_preview([item])
 
-    assert preview["ready"] == 0
-    assert "Main image URL exceeds the MP_ITEM_MATCH v4.2 limit" in preview["items"][0]["errors"][0]
+    assert preview["ready"] == 1
+    assert "mainImageUrl" not in preview["payload"]["MPItem"][0]["Item"]
+    assert any(
+        "non-Walmart image URL was omitted" in warning
+        for warning in preview["items"][0]["warnings"]
+    )
 
 
 def test_inventory_feed_includes_zero_quantity_for_ended_listings():
@@ -383,8 +389,8 @@ def test_item_image_maintenance_feed_matches_current_walmart_schema():
                 "product_id_type": "GTIN",
                 "product_id": "00123456789012",
                 "image_urls": [
-                    "https://i.ebayimg.com/images/g/new-main/s-l1600.jpg",
-                    "https://i.ebayimg.com/images/g/new-back/s-l1600.jpg",
+                    "https://i5.walmartimages.com/asr/new-main.jpeg",
+                    "https://i5.walmartimages.com/asr/new-back.jpeg",
                 ],
             }
         ]
@@ -404,11 +410,28 @@ def test_item_image_maintenance_feed_matches_current_walmart_schema():
         },
     }
     assert item["Visible"]["Cell Phones"]["mainImageUrl"].endswith(
-        "new-main/s-l1600.jpg"
+        "new-main.jpeg"
     )
     assert item["Visible"]["Cell Phones"]["productSecondaryImageURL"] == [
-        "https://i.ebayimg.com/images/g/new-back/s-l1600.jpg"
+        "https://i5.walmartimages.com/asr/new-back.jpeg"
     ]
+
+
+def test_item_image_maintenance_feed_rejects_ebay_images():
+    with pytest.raises(ValueError, match="Walmart-hosted stock image"):
+        build_item_image_maintenance_feed(
+            [
+                {
+                    "sku": "PHONE-1",
+                    "product_type": "Cell Phones",
+                    "product_id_type": "GTIN",
+                    "product_id": "00123456789012",
+                    "image_urls": [
+                        "https://i.ebayimg.com/images/g/new-main/s-l1600.jpg"
+                    ],
+                }
+            ]
+        )
 
 
 def test_walmart_draft_preserves_ebay_data_without_inventing_identifier():

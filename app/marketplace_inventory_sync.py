@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -27,6 +28,8 @@ EBAY_QUOTA_COOLDOWN_SECONDS = 15 * 60
 
 _ebay_trading_retry_at: datetime | None = None
 _ebay_browse_retry_at: datetime | None = None
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -291,11 +294,20 @@ class MarketplaceInventorySyncer:
             for row in ebay_rows
             if str(row.get("sku") or "").strip()
         }
-        quantity_sync_paused = ebay_quantity_source == "ebay_repository_cache_fallback"
-        # Public store-page snapshots prove that a listing exists, but they do
-        # not expose its exact available quantity. Those rows use a conservative
-        # placeholder of one. Never let that placeholder overwrite an exact
-        # repository quantity or either marketplace.
+        quantity_sync_paused = ebay_quantity_source != "ebay_trading_api"
+        # Browse and public store-page snapshots prove that a listing exists,
+        # but they do not reliably expose its exact available quantity. Missing
+        # Browse availability is represented conservatively as one, and a
+        # partial search result cannot prove that an omitted listing ended.
+        # Never let estimated or cached rows overwrite either marketplace.
+        if quantity_sync_paused:
+            logger.warning(
+                "Marketplace quantity writes paused because the eBay quantity "
+                "source is not authoritative: source=%s active_rows=%s warning=%s",
+                ebay_quantity_source,
+                len(ebay_rows),
+                ebay_quantity_warning or "none",
+            )
         if not quantity_sync_paused:
             for row in ebay_by_sku.values():
                 self.repository.update_inventory_quantity(row["sku"], row["quantity"])
@@ -643,6 +655,16 @@ class MarketplaceInventorySyncer:
             for sku, plan in plans.items()
             if plan.update_walmart and sku not in failed_ebay_skus
         ]
+        logger.info(
+            "Marketplace quantity reconciliation planned: source=%s paused=%s "
+            "checked=%s ebay_updates=%s walmart_updates=%s ended=%s",
+            ebay_quantity_source,
+            quantity_sync_paused,
+            len(sync_skus),
+            len(ebay_updates),
+            len(walmart_update_skus),
+            len(ended_skus),
+        )
         walmart_submission: dict[str, Any] | None = None
         if walmart_update_skus:
             walmart_payload = build_inventory_feed(
@@ -864,7 +886,9 @@ class MarketplaceInventorySyncer:
                 and sku not in image_errors
                 and not fields["pending_walmart_image_signature"]
             ):
-                image_candidates[sku] = images
+                # Walmart catalog imagery is authoritative. eBay-origin images
+                # must never be submitted to Walmart, even when they changed.
+                continue
 
         detail_skus = [
             sku
@@ -1081,6 +1105,7 @@ class MarketplaceInventorySyncer:
             "price_markup_percent": price_markup_percent,
             "image_updates_submitted": len(maintenance_skus) if image_submission else 0,
             "image_updates_confirmed": image_updates_confirmed,
+            "walmart_image_source_policy": "walmart_catalog_only",
             "walmart_submission": walmart_submission,
             "image_submission": image_submission,
             "errors": all_errors,

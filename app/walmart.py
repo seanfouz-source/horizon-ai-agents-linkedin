@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import unescape
 from html.parser import HTMLParser
 from typing import Any, Iterable
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -38,6 +38,7 @@ SUPPORTED_CONDITIONS = {
     "New without tags",
     "Pre-Owned: Like New",
 }
+WALMART_IMAGE_HOST_SUFFIX = ".walmartimages.com"
 
 
 class WalmartApiError(RuntimeError):
@@ -677,20 +678,21 @@ def build_full_item_from_catalog_template(
     orderable.setdefault("specProductType", product_type)
     product_content["condition"] = condition
 
-    ebay_images = _maintenance_image_urls([item.image_url, *item.image_urls])
     raw_secondary_images = product_content.get("productSecondaryImageURL")
     if not isinstance(raw_secondary_images, (list, tuple)):
         raw_secondary_images = [raw_secondary_images]
     template_images = _maintenance_image_urls(
         [product_content.get("mainImageUrl"), *raw_secondary_images]
     )
-    images = list(dict.fromkeys([*ebay_images, *template_images]))
-    if images:
-        product_content["mainImageUrl"] = images[0]
-        if len(images) > 1:
-            product_content["productSecondaryImageURL"] = images[1:20]
-        else:
-            product_content.pop("productSecondaryImageURL", None)
+    if not template_images:
+        raise ValueError(
+            "The Walmart full-item template did not provide a Walmart-hosted stock image."
+        )
+    product_content["mainImageUrl"] = template_images[0]
+    if len(template_images) > 1:
+        product_content["productSecondaryImageURL"] = template_images[1:20]
+    else:
+        product_content.pop("productSecondaryImageURL", None)
     if not str(product_content.get("productName") or "").strip():
         product_content["productName"] = item.title
     if not str(product_content.get("shortDescription") or "").strip() and item.description:
@@ -785,9 +787,12 @@ def build_offer_match_from_catalog_template(
     entry["price"] = round(float(price), 2)
     entry["ShippingWeight"] = round(float(shipping_weight), 3)
     entry["condition"] = condition
-    main_image_url = str(resolved.get("main_image_url") or "").strip()
-    if main_image_url:
-        entry["mainImageUrl"] = main_image_url
+    template_image_url = entry.get("mainImageUrl")
+    approved_images = _maintenance_image_urls(
+        [template_image_url, resolved.get("main_image_url")]
+    )
+    if approved_images:
+        entry["mainImageUrl"] = approved_images[0]
     else:
         entry.pop("mainImageUrl", None)
     return payload
@@ -829,7 +834,9 @@ def build_item_image_maintenance_feed(
         if product_id_type not in PRODUCT_ID_TYPES or not product_id:
             raise ValueError(f"Walmart item maintenance requires a product identifier for SKU {sku}.")
         if not image_urls:
-            raise ValueError(f"Walmart item maintenance requires at least one image for SKU {sku}.")
+            raise ValueError(
+                f"Walmart item maintenance requires at least one Walmart-hosted stock image for SKU {sku}."
+            )
         entries.append(
             {
                 "Orderable": {
@@ -909,12 +916,22 @@ def _maintenance_image_urls(value: object) -> list[str]:
     urls: list[str] = []
     for raw_value in raw_values:
         url = str(raw_value or "").strip()
-        if not url.startswith("https://") or len(url) > 2500 or url in urls:
+        if not _is_walmart_image_url(url) or len(url) > 2500 or url in urls:
             continue
         urls.append(url)
         if len(urls) >= 20:
             break
     return urls
+
+
+def _is_walmart_image_url(value: object) -> bool:
+    url = str(value or "").strip()
+    if not url.startswith("https://"):
+        return False
+    hostname = str(urlparse(url).hostname or "").lower()
+    return hostname == "walmartimages.com" or hostname.endswith(
+        WALMART_IMAGE_HOST_SUFFIX
+    )
 
 
 def build_walmart_catalog_query(item: InventoryItem) -> str:
@@ -951,8 +968,6 @@ def build_walmart_draft(
     identifier_type, identifier = _product_identifier(item, WalmartItemOverride())
     shipping_weight_lbs = _shipping_weight_lbs(item.item_specifics)
     mapped_condition = _walmart_condition_for_item(item)
-    images = [url for url in [item.image_url, *item.image_urls] if str(url or "").strip()]
-    images = list(dict.fromkeys(images))
     catalog = catalog_result or {
         "status": "lookup_failed" if lookup_error else "not_requested",
         "query": build_walmart_catalog_query(item),
@@ -960,6 +975,9 @@ def build_walmart_draft(
     }
     candidates = catalog.get("candidates") if isinstance(catalog.get("candidates"), list) else []
     verified_match, match_reason = select_verified_catalog_match(item, candidates)
+    images = _maintenance_image_urls(
+        [verified_match.get("image_url") if verified_match else None]
+    )
     if not identifier_type and verified_match:
         identifier_type = str(verified_match["product_id_type"])
         identifier = str(verified_match["product_id"])
@@ -1301,7 +1319,13 @@ def _build_offer_match_item(
         else walmart_price(item.price, price_markup_percent)
     )
     quantity = override.quantity if override.quantity is not None else item.quantity
-    main_image_url = override.main_image_url or item.image_url
+    raw_main_image_url = override.main_image_url or item.image_url
+    approved_images = _maintenance_image_urls([raw_main_image_url])
+    main_image_url = approved_images[0] if approved_images else None
+    if raw_main_image_url and main_image_url is None:
+        warnings.append(
+            "A non-Walmart image URL was omitted; Walmart catalog stock imagery must be used."
+        )
 
     if not item.sku or len(item.sku) > 50:
         errors.append("Walmart requires a seller SKU between 1 and 50 characters.")
@@ -1326,10 +1350,10 @@ def _build_offer_match_item(
         else:
             warnings.append(f"{message} The optional image was omitted.")
         main_image_url = None
-    if condition in CONDITION_IMAGE_REQUIRED and not main_image_url and not any(
-        "Main image URL exceeds" in error for error in errors
-    ):
-        errors.append(f"Walmart requires a main image for condition {condition!r}.")
+    if condition in CONDITION_IMAGE_REQUIRED and not main_image_url:
+        warnings.append(
+            "No seller image was submitted; the verified Walmart catalog template must supply the stock image."
+        )
 
     resolved = {
         "product_id_type": product_id_type,

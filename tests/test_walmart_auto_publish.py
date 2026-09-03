@@ -261,6 +261,7 @@ def test_auto_publish_uses_walmart_full_item_template_when_search_requires_it(
                             "brand": "Apple",
                             "has_written_warranty": "No",
                             "isProp65WarningRequired": "No",
+                            "mainImageUrl": "https://i5.walmartimages.com/catalog.jpg",
                         }
                     },
                 }
@@ -294,6 +295,10 @@ def test_auto_publish_uses_walmart_full_item_template_when_search_requires_it(
     full_item = client.full_item_payloads[0]["MPItem"][0]
     assert full_item["Orderable"]["price"] == 440.0
     assert full_item["Visible"]["Cell Phones"]["condition"] == "Open Box"
+    assert (
+        full_item["Visible"]["Cell Phones"]["mainImageUrl"]
+        == "https://i5.walmartimages.com/catalog.jpg"
+    )
     assert client.inventory_payloads[0]["Inventory"][0]["quantity"]["amount"] == 2
 
 

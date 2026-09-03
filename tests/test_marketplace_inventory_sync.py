@@ -277,7 +277,7 @@ class FakeWalmartClient:
         raise AssertionError(f"Unexpected detail lookup for {sku}")
 
 
-def test_syncer_updates_changed_images_and_zeroes_ended_listing(tmp_path):
+def test_syncer_keeps_ebay_images_off_walmart_and_zeroes_ended_listing(tmp_path):
     repository = InventoryRepository(tmp_path / "inventory.db")
     repository.upsert_items(
         [
@@ -319,7 +319,8 @@ def test_syncer_updates_changed_images_and_zeroes_ended_listing(tmp_path):
     assert walmart.price_updates == [
         {"sku": "PHONE-LIVE", "amount": 110.0, "currency": "USD"}
     ]
-    assert first["image_updates_submitted"] == 1
+    assert first["image_updates_submitted"] == 0
+    assert first["walmart_image_source_policy"] == "walmart_catalog_only"
     assert ebay.image_refreshes == [["100"]]
     inventory_rows = walmart.inventory_payloads[0]["Inventory"]
     assert inventory_rows == [
@@ -329,17 +330,13 @@ def test_syncer_updates_changed_images_and_zeroes_ended_listing(tmp_path):
             "inventoryAvailableDate": inventory_rows[0]["inventoryAvailableDate"],
         }
     ]
-    image_item = walmart.image_payloads[0]["MPItem"][0]
-    assert image_item["Orderable"]["sku"] == "PHONE-LIVE"
-    assert image_item["Visible"]["Cell Phones"]["mainImageUrl"].endswith(
-        "new-main/s-l1600.jpg"
-    )
+    assert walmart.image_payloads == []
     ended_state = repository.marketplace_inventory_sync_state("PHONE-ENDED")
     live_state = repository.marketplace_inventory_sync_state("PHONE-LIVE")
     assert ended_state["ebay_quantity"] == 0
     assert ended_state["pending_walmart_quantity"] == 0
-    assert live_state["pending_walmart_image_signature"] is not None
-    assert live_state["last_image_feed_id"] == "IMAGE@123"
+    assert live_state["pending_walmart_image_signature"] is None
+    assert live_state["last_image_feed_id"] is None
 
     walmart.quantities["PHONE-ENDED"] = 0
     walmart.feed_status = {
@@ -350,14 +347,13 @@ def test_syncer_updates_changed_images_and_zeroes_ended_listing(tmp_path):
     }
     second = asyncio.run(syncer.sync_once())
 
-    assert second["image_updates_confirmed"] == 1
+    assert second["image_updates_confirmed"] == 0
     assert second["image_updates_submitted"] == 0
     assert second["updated_prices"] == 0
     assert len(walmart.price_updates) == 1
-    assert len(walmart.image_payloads) == 1
+    assert walmart.image_payloads == []
     live_state = repository.marketplace_inventory_sync_state("PHONE-LIVE")
     assert live_state["pending_walmart_image_signature"] is None
-    assert live_state["synced_image_signature"] == live_state["ebay_image_signature"]
     assert live_state["ebay_price"] == 100.0
     assert live_state["synced_walmart_price"] == 110.0
 
@@ -681,7 +677,7 @@ def test_ebay_number_sku_maps_to_live_seller_sku_without_a_draft(tmp_path):
     assert walmart.inventory_payloads[0]["Inventory"][0]["quantity"]["amount"] == 3
 
 
-def test_trading_quota_failure_uses_browse_quantities_and_rebaselines_from_ebay(tmp_path):
+def test_trading_quota_failure_pauses_quantity_writes_for_browse_fallback(tmp_path):
     class BrowseFallbackEbayClient(FakeEbayClient):
         async def fetch_active_inventory_quantities(self, *, limit):
             raise ValueError("Trading API usage limit exceeded")
@@ -739,12 +735,61 @@ def test_trading_quota_failure_uses_browse_quantities_and_rebaselines_from_ebay(
 
     assert result["status"] == "ok"
     assert result["ebay_quantity_source"] == "ebay_browse_api_fallback"
+    assert result["quantity_sync_paused"] is True
     assert result["updated_ebay"] == 0
-    assert result["updated_walmart"] == 1
+    assert result["updated_walmart"] == 0
+    assert result["zeroed_walmart"] == 0
     assert ebay.revisions == []
+    assert walmart.inventory_payloads == []
     state = repository.marketplace_inventory_sync_state("EBAY-123456789012")
-    assert state["last_source"] == "ebay_policy_baseline"
+    assert state["last_source"] == "ebay_quantity_unavailable"
     assert state["quantity_policy_version"] == QUANTITY_POLICY_VERSION
+
+
+def test_browse_placeholder_one_cannot_reduce_walmart_quantity(tmp_path):
+    class BrowseFallbackEbayClient(FakeEbayClient):
+        async def fetch_active_inventory_quantities(self, *, limit):
+            raise ValueError("Trading API usage limit exceeded")
+
+        async def fetch_active_browse_inventory_quantities(self, *, limit):
+            assert limit == 200
+            return [
+                {
+                    "sku": "PHONE-LIVE",
+                    "item_id": "100",
+                    "quantity": 1,
+                    "inventory_tracking": "item_id",
+                    "image_urls": [],
+                    "image_complete": False,
+                }
+            ]
+
+    repository = _live_listing_repository(tmp_path)
+    repository.update_inventory_quantity("PHONE-LIVE", 5)
+    repository.upsert_marketplace_inventory_sync_state(
+        sku="PHONE-LIVE",
+        ebay_item_id="100",
+        ebay_quantity=5,
+        walmart_quantity=5,
+        synced_quantity=5,
+        quantity_policy_version=QUANTITY_POLICY_VERSION,
+        last_source="already_equal",
+        status="synced",
+    )
+    ebay = BrowseFallbackEbayClient()
+    walmart = FakeWalmartClient()
+    walmart.published_items = walmart.published_items[:1]
+    walmart.quantities = {"PHONE-LIVE": 5}
+
+    result = asyncio.run(MarketplaceInventorySyncer(repository, ebay, walmart).sync_once())
+
+    assert result["ebay_quantity_source"] == "ebay_browse_api_fallback"
+    assert result["quantity_sync_paused"] is True
+    assert result["updated_ebay"] == 0
+    assert result["updated_walmart"] == 0
+    assert ebay.revisions == []
+    assert walmart.inventory_payloads == []
+    assert repository.get("PHONE-LIVE").quantity == 5
 
 
 def test_both_ebay_quotas_use_latest_store_snapshot_without_zeroing_missing_items(
