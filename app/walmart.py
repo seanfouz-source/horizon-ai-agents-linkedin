@@ -142,6 +142,17 @@ class WalmartMarketplaceClient:
             "candidates": candidates,
         }
 
+    async def search_catalog_specs_by_query(self, query: str) -> dict[str, Any]:
+        clean_query = re.sub(r"\s+", " ", str(query or "")).strip()
+        if not clean_query:
+            raise WalmartApiError("A Walmart catalog search query is required.")
+        response = await self._request(
+            "GET",
+            "/v3/items/walmart/search",
+            params={"query": clean_query, "responseFormat": "SPEC"},
+        )
+        return self._json_object(response)
+
     async def enrich_catalog_candidate(self, candidate: dict[str, Any]) -> dict[str, Any]:
         """Add the public product identifier and weight for one Walmart item candidate."""
         item_id = str(candidate.get("walmart_item_id") or "").strip()

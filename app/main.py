@@ -2653,6 +2653,19 @@ async def walmart_catalog_items(
         raise _walmart_http_error(exc) from exc
 
 
+@app.get("/walmart/catalog/search-spec")
+async def walmart_catalog_search_spec(
+    request: Request,
+    query: str,
+    x_horizon_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_secret(x_horizon_secret, request.query_params.get("secret"))
+    try:
+        return await walmart_client.search_catalog_specs_by_query(query)
+    except WalmartApiError as exc:
+        raise _walmart_http_error(exc) from exc
+
+
 @app.post("/walmart/catalog/repair-apple-errors")
 async def repair_walmart_apple_catalog_errors(
     repair_request: WalmartCatalogRepairRequest,
