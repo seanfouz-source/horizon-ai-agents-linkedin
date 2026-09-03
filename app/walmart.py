@@ -1185,7 +1185,10 @@ def _walmart_condition(value: str | None) -> str | None:
         "new with defects": "New with defects",
         "new without box": "New without box",
         "new without tags": "New without tags",
-        "open box": "Open Box",
+        # This seller is enrolled in Walmart Pre-Owned. eBay's "Open box"
+        # condition belongs in the closest truthful Pre-Owned grade rather than
+        # Walmart's separately controlled Open Box program lane.
+        "open box": "Pre-Owned: Like New",
         "remanufactured": "Remanufactured",
         "pre-owned: fair": "Pre-Owned: Fair",
         "pre-owned: good": "Pre-Owned: Good",

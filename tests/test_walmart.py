@@ -38,7 +38,7 @@ def test_offer_match_preview_maps_ebay_fields():
     assert offer["sku"] == "EBAY-123"
     assert offer["productIdentifiers"] == {"productIdType": "UPC", "productId": "887276900124"}
     assert offer["ShippingWeight"] == 1.5
-    assert offer["condition"] == "Open Box"
+    assert offer["condition"] == "Pre-Owned: Like New"
     assert offer["price"] == 577.5
 
 
@@ -180,7 +180,7 @@ def test_walmart_draft_preserves_ebay_data_without_inventing_identifier():
 
     assert draft["status"] == "draft_needs_review"
     assert draft["prepared_listing"]["shipping_weight_lbs"] == 0.5
-    assert draft["prepared_listing"]["condition"] == "Open Box"
+    assert draft["prepared_listing"]["condition"] == "Pre-Owned: Like New"
     assert draft["prepared_listing"]["price"] == 493.9
     assert draft["prepared_listing"]["source_price"] == 449
     assert draft["prepared_listing"]["price_markup_percent"] == 10.0
