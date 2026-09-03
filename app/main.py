@@ -2731,7 +2731,10 @@ async def repair_walmart_apple_catalog_errors(
             "condition": "Open Box",
             "price": price,
             "quantity": max(1, int(source_item.quantity or 0)),
-            "main_image_url": source_item.image_url,
+            # Apple repairs must inherit Walmart-owned catalog content and images.
+            # Supplying an eBay image here turns setup-by-match into a content
+            # contribution and can keep an Intellectual Property review active.
+            "main_image_url": None,
         }
         try:
             spec = await walmart_client.search_catalog(product_id_type, product_id)
