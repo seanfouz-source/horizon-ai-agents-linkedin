@@ -512,3 +512,123 @@ def test_later_walmart_sale_reduces_ebay_through_client_call(tmp_path):
     assert repository.marketplace_inventory_sync_state("PHONE-LIVE")["last_source"] == (
         "walmart_sale"
     )
+
+
+def test_walmart_alias_sale_updates_original_ebay_sku_by_item_id(tmp_path):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    repository.upsert_items(
+        [
+            InventoryItem(
+                sku="PHONE-LIVE",
+                ebay_item_id="100",
+                title="Live phone",
+                quantity=2,
+                source="ebay-api",
+            )
+        ]
+    )
+    repository.upsert_walmart_drafts(
+        [
+            {
+                "sku": "WALMART-ALIAS",
+                "ebay_item_id": "100",
+                "source_snapshot": {
+                    "sku": "OLD-EBAY-SKU",
+                    "ebay_item_id": "100",
+                    "title": "Live phone",
+                    "quantity": 2,
+                },
+                "prepared_listing": {"images": []},
+            }
+        ]
+    )
+    repository.upsert_marketplace_inventory_sync_state(
+        sku="WALMART-ALIAS",
+        ebay_item_id="100",
+        ebay_quantity=2,
+        walmart_quantity=2,
+        synced_quantity=2,
+        quantity_policy_version=2,
+        last_source="already_equal",
+        status="synced",
+    )
+    ebay = FakeEbayClient()
+    walmart = FakeWalmartClient()
+    walmart.published_items = [
+        {
+            "sku": "WALMART-ALIAS",
+            "published_status": "PUBLISHED",
+            "lifecycle_status": "ACTIVE",
+            "product_type": "Cell Phones",
+            "product_id_type": "GTIN",
+            "product_id": "00123456789012",
+        }
+    ]
+    walmart.quantities = {"WALMART-ALIAS": 1}
+
+    result = asyncio.run(MarketplaceInventorySyncer(repository, ebay, walmart).sync_once())
+
+    assert result["updated_ebay"] == 1
+    assert result["ended_ebay_skus"] == 0
+    assert result["unresolved_alias_skus"] == 0
+    assert ebay.revisions[0]["sku"] == "PHONE-LIVE"
+    assert ebay.revisions[0]["item_id"] == "100"
+    assert ebay.revisions[0]["quantity"] == 1
+    assert repository.marketplace_inventory_sync_state("WALMART-ALIAS")["last_source"] == (
+        "walmart_sale"
+    )
+
+
+def test_ambiguous_walmart_aliases_are_not_zeroed_or_applied_to_ebay(tmp_path):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    repository.upsert_items(
+        [
+            InventoryItem(
+                sku="PHONE-LIVE",
+                ebay_item_id="100",
+                title="Variation listing",
+                quantity=2,
+                source="ebay-api",
+            )
+        ]
+    )
+    repository.upsert_walmart_drafts(
+        [
+            {
+                "sku": sku,
+                "ebay_item_id": "100",
+                "source_snapshot": {
+                    "sku": "OLD-VARIATION-SKU",
+                    "ebay_item_id": "100",
+                    "title": sku,
+                    "quantity": 1,
+                },
+            }
+            for sku in ("WALMART-VARIANT-A", "WALMART-VARIANT-B")
+        ]
+    )
+    ebay = FakeEbayClient()
+    walmart = FakeWalmartClient()
+    walmart.published_items = [
+        {
+            "sku": sku,
+            "published_status": "PUBLISHED",
+            "lifecycle_status": "ACTIVE",
+            "product_type": "Cell Phones",
+            "product_id_type": "GTIN",
+            "product_id": product_id,
+        }
+        for sku, product_id in (
+            ("WALMART-VARIANT-A", "00123456789012"),
+            ("WALMART-VARIANT-B", "00123456789029"),
+        )
+    ]
+    walmart.quantities = {"WALMART-VARIANT-A": 1, "WALMART-VARIANT-B": 1}
+
+    result = asyncio.run(MarketplaceInventorySyncer(repository, ebay, walmart).sync_once())
+
+    assert result["status"] == "no_published_matches"
+    assert result["unresolved_alias_skus"] == 2
+    assert result["ended_ebay_skus"] == 0
+    assert ebay.revisions == []
+    assert walmart.inventory_payloads == []

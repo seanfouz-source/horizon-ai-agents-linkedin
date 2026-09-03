@@ -207,6 +207,7 @@ class MarketplaceInventorySyncer:
         }
         for row in ebay_by_sku.values():
             self.repository.update_inventory_quantity(row["sku"], row["quantity"])
+        ebay_source_by_sku = ebay_by_sku
 
         walmart_items = await self.walmart_client.list_published_items(limit=1000)
         walmart_by_item_sku = {
@@ -220,31 +221,85 @@ class MarketplaceInventorySyncer:
             for row in self.repository.walmart_drafts(skus=walmart_skus, limit=200)
             if str(row.get("sku") or "").strip()
         }
-        ebay_items_by_sku = {
+        walmart_skus_by_item_id: dict[str, set[str]] = {}
+        for walmart_sku, draft in draft_by_sku.items():
+            item_id = str(
+                draft.get("ebay_item_id")
+                or (draft.get("source_snapshot") or {}).get("ebay_item_id")
+                or ""
+            ).strip()
+            if item_id:
+                walmart_skus_by_item_id.setdefault(item_id, set()).add(walmart_sku)
+        ebay_rows_by_item_id: dict[str, list[dict[str, Any]]] = {}
+        for row in ebay_source_by_sku.values():
+            item_id = str(row.get("item_id") or "").strip()
+            if item_id:
+                ebay_rows_by_item_id.setdefault(item_id, []).append(row)
+
+        ebay_by_sku = {}
+        unresolved_alias_skus: set[str] = set()
+        for walmart_sku in walmart_skus:
+            source_row = ebay_source_by_sku.get(walmart_sku)
+            draft = draft_by_sku.get(walmart_sku) or {}
+            source_snapshot = draft.get("source_snapshot") or {}
+            snapshot_sku = str(source_snapshot.get("sku") or "").strip()
+            if source_row is None and snapshot_sku:
+                source_row = ebay_source_by_sku.get(snapshot_sku)
+            item_id = str(
+                draft.get("ebay_item_id")
+                or source_snapshot.get("ebay_item_id")
+                or ""
+            ).strip()
+            if source_row is None and item_id:
+                ebay_candidates = ebay_rows_by_item_id.get(item_id) or []
+                walmart_candidates = walmart_skus_by_item_id.get(item_id) or set()
+                if len(ebay_candidates) == 1 and len(walmart_candidates) == 1:
+                    source_row = ebay_candidates[0]
+                elif ebay_candidates:
+                    unresolved_alias_skus.add(walmart_sku)
+            if source_row is not None:
+                ebay_by_sku[walmart_sku] = source_row
+
+        source_skus = {
+            str(row.get("sku") or "").strip()
+            for row in ebay_by_sku.values()
+            if str(row.get("sku") or "").strip()
+        }
+        ebay_items_by_source_sku = {
             item.sku: item
             for item in self.repository.ebay_items(
-                skus=walmart_skus,
+                skus=source_skus,
                 limit=200,
                 include_inactive=True,
             )
         }
         excluded_skus = {
-            sku: term
-            for sku, item in ebay_items_by_sku.items()
-            if (term := self._walmart_exclusion(item)) is not None
+            walmart_sku: term
+            for walmart_sku, source_row in ebay_by_sku.items()
+            if (
+                source_item := ebay_items_by_source_sku.get(
+                    str(source_row.get("sku") or "").strip()
+                )
+            ) is not None
+            and (term := self._walmart_exclusion(source_item)) is not None
         }
-        common_skus = sorted(set(ebay_by_sku) & walmart_skus)
-        ended_skus = sorted((walmart_skus & set(draft_by_sku)) - set(ebay_by_sku))
+        common_skus = sorted(ebay_by_sku)
+        ended_skus = sorted(
+            (walmart_skus & set(draft_by_sku))
+            - set(ebay_by_sku)
+            - unresolved_alias_skus
+        )
         sync_skus = sorted(set(common_skus) | set(ended_skus))
         if not sync_skus:
             return {
                 "status": "no_published_matches",
                 "checked": 0,
-                "ebay_active_skus": len(ebay_by_sku),
+                "ebay_active_skus": len(ebay_source_by_sku),
                 "ebay_image_skus": sum(
-                    1 for row in ebay_by_sku.values() if row["image_urls"]
+                    1 for row in ebay_source_by_sku.values() if row["image_urls"]
                 ),
                 "walmart_published_skus": len(walmart_skus),
+                "unresolved_alias_skus": len(unresolved_alias_skus),
                 "ended_ebay_skus": 0,
                 "updated_ebay": 0,
                 "updated_walmart": 0,
@@ -382,7 +437,7 @@ class MarketplaceInventorySyncer:
 
         ebay_updates = [
             {
-                "sku": sku,
+                "sku": ebay_by_sku[sku]["sku"],
                 "item_id": ebay_by_sku[sku]["item_id"],
                 "quantity": plan.target_quantity,
                 **(
@@ -408,13 +463,17 @@ class MarketplaceInventorySyncer:
             if plan.update_ebay and sku in ebay_by_sku
         ]
         ebay_update_results = await self.ebay_client.revise_inventory_quantities(ebay_updates)
-        ebay_result_by_sku = {
+        ebay_result_by_source_sku = {
             str(result["sku"]): result for result in ebay_update_results
         }
         failed_ebay_skus = {
             sku
-            for sku, result in ebay_result_by_sku.items()
-            if result.get("status") != "updated"
+            for sku, plan in plans.items()
+            if plan.update_ebay
+            and (
+                ebay_result_by_source_sku.get(str(ebay_by_sku[sku]["sku"]), {}).get("status")
+                != "updated"
+            )
         }
         for sku in failed_ebay_skus:
             quantity_errors[sku] = "eBay rejected the quantity update."
@@ -523,7 +582,7 @@ class MarketplaceInventorySyncer:
             item_id = ebay_by_sku[sku]["item_id"]
             if item_id not in image_refresh_item_ids:
                 continue
-            refreshed = refreshed_by_sku.get(sku)
+            refreshed = refreshed_by_sku.get(str(ebay_by_sku[sku].get("sku") or ""))
             full_images = _normalized_image_urls(
                 refreshed.get("image_urls") if refreshed else None
             )
@@ -824,12 +883,13 @@ class MarketplaceInventorySyncer:
         return {
             "status": "partial_error" if all_errors else "ok",
             "checked": len(sync_skus),
-            "ebay_active_skus": len(ebay_by_sku),
+            "ebay_active_skus": len(ebay_source_by_sku),
             "ebay_image_skus": sum(
-                1 for row in ebay_by_sku.values() if row["image_urls"]
+                1 for row in ebay_source_by_sku.values() if row["image_urls"]
             ),
             "walmart_published_skus": len(walmart_skus),
             "ended_ebay_skus": len(ended_skus),
+            "unresolved_alias_skus": len(unresolved_alias_skus),
             "updated_ebay": len(ebay_updates) - len(failed_ebay_skus),
             "updated_walmart": len(walmart_update_skus) if walmart_submission else 0,
             "zeroed_walmart": (
