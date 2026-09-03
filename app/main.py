@@ -54,6 +54,7 @@ from app.models import (
     WalmartDraftGenerateRequest,
     WalmartInventorySyncRequest,
     WalmartItemOverride,
+    WalmartOfferFeedReconcileRequest,
 )
 from app.reports import (
     MetricoolReportError,
@@ -2828,10 +2829,19 @@ async def submit_walmart_import(
             else:
                 submission = await walmart_client.submit_offer_match_feed(group["payload"])
         except WalmartApiError as exc:
+            repository.update_walmart_draft_publish_state(
+                group["skus"], "offer_failed", error_message=str(exc)
+            )
             submission_errors.append(
                 {"feed_type": group["feed_type"], "skus": group["skus"], "message": str(exc)}
             )
         else:
+            repository.update_walmart_draft_publish_state(
+                group["skus"],
+                "offer_submitted_inventory_pending",
+                offer_feed_id=str(submission["feed_id"]),
+                increment_attempts=True,
+            )
             submissions.append({**submission, "skus": group["skus"]})
     if not submissions:
         message = (
@@ -2889,6 +2899,42 @@ async def walmart_feed_status(
         )
     except WalmartApiError as exc:
         raise _walmart_http_error(exc) from exc
+
+
+@app.post("/walmart/import/reconcile")
+async def reconcile_walmart_import(
+    reconcile_request: WalmartOfferFeedReconcileRequest,
+    request: Request,
+    x_horizon_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_secret(x_horizon_secret, request.query_params.get("secret"))
+    if not reconcile_request.confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Set confirm=true to persist this Walmart offer feed result.",
+        )
+    try:
+        feed = await walmart_client.get_feed_status(
+            reconcile_request.feed_id,
+            include_details=True,
+        )
+    except WalmartApiError as exc:
+        raise _walmart_http_error(exc) from exc
+
+    feed_status = str(feed.get("feedStatus") or "").upper()
+    repository.update_walmart_draft_publish_state(
+        reconcile_request.skus,
+        "offer_submitted_inventory_pending",
+        offer_feed_id=reconcile_request.feed_id,
+    )
+    states: dict[str, str] = {}
+    if feed_status == "PROCESSED":
+        states = _apply_walmart_offer_feed_results(feed, set(reconcile_request.skus))
+    return {
+        "feed_id": reconcile_request.feed_id,
+        "feed_status": feed_status,
+        "states": states,
+    }
 
 
 @app.post("/walmart/inventory/sync")
