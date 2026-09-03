@@ -715,7 +715,7 @@ def build_walmart_draft(
     specifics = {_normalize_key(key): str(value or "").strip() for key, value in item.item_specifics.items()}
     identifier_type, identifier = _product_identifier(item, WalmartItemOverride())
     shipping_weight_lbs = _shipping_weight_lbs(item.item_specifics)
-    mapped_condition = _walmart_condition(item.condition)
+    mapped_condition = _walmart_condition_for_item(item)
     images = [url for url in [item.image_url, *item.image_urls] if str(url or "").strip()]
     images = list(dict.fromkeys(images))
     catalog = catalog_result or {
@@ -899,7 +899,7 @@ def plausible_catalog_candidates(
             continue
         verified.append(candidate)
 
-    source_condition = _walmart_condition(item.condition)
+    source_condition = _walmart_condition_for_item(item)
     if source_condition == "Open Box":
         open_box = [
             candidate
@@ -1059,7 +1059,7 @@ def _build_offer_match_item(
         shipping_weight_lbs = default_shipping_weight_lbs
         if shipping_weight_lbs is not None:
             warnings.append("Used WALMART_DEFAULT_SHIPPING_WEIGHT_LBS; verify the packaged weight before submission.")
-    condition = _walmart_condition(override.condition or item.condition)
+    condition = _walmart_condition_for_item(item, override.condition)
     price = (
         override.price
         if override.price is not None
@@ -1201,6 +1201,25 @@ def _walmart_condition(value: str | None) -> str | None:
         "used - like new": "Pre-Owned: Like New",
     }
     return exact.get(clean)
+
+
+def _walmart_condition_for_item(
+    item: InventoryItem,
+    override_condition: str | None = None,
+) -> str | None:
+    mapped = _walmart_condition(override_condition or item.condition)
+    if mapped:
+        return mapped
+    specifics = {
+        _normalize_key(key): str(value or "").strip().lower()
+        for key, value in item.item_specifics.items()
+    }
+    if specifics.get("conditionid") == "1500":
+        return "Open Box"
+    listing_text = f"{item.title or ''} {item.description or ''}"
+    if re.search(r"\bopen[ -]?box\b", listing_text, re.IGNORECASE):
+        return "Open Box"
+    return None
 
 
 def normalize_product_identifier(

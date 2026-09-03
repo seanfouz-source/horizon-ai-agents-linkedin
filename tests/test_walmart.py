@@ -61,6 +61,39 @@ def test_offer_match_preview_maps_ebay_open_box_api_codes():
         assert preview["items"][0]["resolved"]["condition"] == "Open Box"
 
 
+def test_offer_match_preview_recovers_open_box_from_ebay_listing_data():
+    items = [
+        InventoryItem(
+            sku="EBAY-DESCRIPTION",
+            title="Apple iPhone 13 256GB Blue",
+            description="Open box item in excellent condition with original packaging.",
+            condition=None,
+            price=385,
+            quantity=1,
+            image_url="https://i.ebayimg.com/images/g/demo/s-l1600.jpg",
+            item_specifics={"UPC": "194252053164", "Shipping Weight": "1 lb"},
+        ),
+        InventoryItem(
+            sku="EBAY-CONDITION-ID",
+            title="Samsung Galaxy S25 128GB",
+            condition=None,
+            price=525,
+            quantity=1,
+            image_url="https://i.ebayimg.com/images/g/demo/s-l1600.jpg",
+            item_specifics={
+                "UPC": "887276900124",
+                "Shipping Weight": "1 lb",
+                "conditionId": "1500",
+            },
+        ),
+    ]
+
+    preview = build_offer_match_preview(items)
+
+    assert preview["ready"] == 2
+    assert {row["resolved"]["condition"] for row in preview["items"]} == {"Open Box"}
+
+
 def test_offer_match_preview_blocks_missing_identifier_and_weight():
     item = InventoryItem(
         sku="EBAY-123",
