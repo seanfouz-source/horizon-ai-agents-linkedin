@@ -238,6 +238,71 @@ def test_offer_match_builder_preserves_walmart_template_identifier_and_category(
     assert offer["mainImageUrl"] == item.image_url
 
 
+def test_offer_match_builder_can_omit_catalog_content_for_repair_feed():
+    item = InventoryItem(
+        sku="APPLE-REPAIR-1",
+        title="Apple iPhone 13 256GB Blue Open Box",
+        condition="Open box",
+        price=385,
+        quantity=4,
+    )
+    catalog = {
+        "matched": True,
+        "version": "4.2",
+        "item_spec_payload": {
+            "MPItemFeedHeader": {
+                "sellingChannel": "mpsetupbymatch",
+                "locale": "en",
+                "version": "4.2",
+                "subset": "external",
+            },
+            "MPItem": [
+                {
+                    "Item": {
+                        "productIdentifiers": {
+                            "productId": "00465915248396",
+                            "productIdType": "GTIN",
+                        },
+                        "productCategory": "Cell Phones",
+                        "productName": "Apple iPhone 13 256GB Blue",
+                        "shortDescription": "Dual 12 MP rear cameras.",
+                        "longDescription": "Rear camera: 48 MP. Books.",
+                        "keyFeatures": ["Storage ranges from 128GB to 512GB"],
+                        "mainImageUrl": "https://i5.walmartimages.com/catalog.jpg",
+                    }
+                }
+            ],
+        },
+    }
+
+    payload = build_offer_match_from_catalog_template(
+        item,
+        catalog,
+        {
+            "product_id_type": "GTIN",
+            "product_id": "00465915248396",
+            "shipping_weight_lbs": 1.0,
+            "price": 423.5,
+            "condition": "Open Box",
+            "main_image_url": None,
+            "offer_only": True,
+        },
+    )
+
+    offer = payload["MPItem"][0]["Item"]
+    assert offer == {
+        "productIdentifiers": {
+            "productId": "00465915248396",
+            "productIdType": "GTIN",
+        },
+        "productCategory": "Cell Phones",
+        "sku": "APPLE-REPAIR-1",
+        "price": 423.5,
+        "ShippingWeight": 1.0,
+        "condition": "Open Box",
+    }
+
+
 def test_offer_match_preview_blocks_missing_identifier_and_weight():
     item = InventoryItem(
         sku="EBAY-123",

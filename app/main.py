@@ -2735,6 +2735,11 @@ async def repair_walmart_apple_catalog_errors(
             # Supplying an eBay image here turns setup-by-match into a content
             # contribution and can keep an Intellectual Property review active.
             "main_image_url": None,
+            # Keep the exact Walmart match template and identifier, but do not
+            # re-submit Walmart catalog descriptions/specs as seller content.
+            # Some Apple templates contain internally contradictory text that
+            # Walmart's content-standard checks reject when it is echoed back.
+            "offer_only": True,
         }
         try:
             spec = await walmart_client.search_catalog(product_id_type, product_id)

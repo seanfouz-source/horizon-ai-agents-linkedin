@@ -754,6 +754,23 @@ def build_offer_match_from_catalog_template(
     ):
         raise ValueError("The Walmart match template identifier does not match the eBay item identifier.")
 
+    # A SPEC response can include Walmart catalog content in addition to the
+    # identifiers needed for setup by match. Re-sending that content makes it
+    # look like a seller contribution, and catalog text can itself contain
+    # contradictions that fail Walmart's content review. For repair feeds,
+    # retain only the exact Walmart identifier/category and send seller-owned
+    # offer fields below. Walmart continues to supply the catalog content and
+    # images for the matched product.
+    if resolved.get("offer_only") is True:
+        offer_entry: dict[str, Any] = {
+            "productIdentifiers": copy.deepcopy(template_identifiers),
+        }
+        product_category = entry.get("productCategory")
+        if product_category is not None:
+            offer_entry["productCategory"] = copy.deepcopy(product_category)
+        entries[0]["Item"] = offer_entry
+        entry = offer_entry
+
     price = resolved.get("price")
     shipping_weight = resolved.get("shipping_weight_lbs")
     condition = str(resolved.get("condition") or "").strip()
