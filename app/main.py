@@ -2584,6 +2584,7 @@ def walmart_auto_publish_current_status() -> dict[str, Any]:
             if term.strip()
         ],
         "startup_retry": repository.service_run_marker(WALMART_OPEN_BOX_RETRY_MARKER),
+        "publish_failures": repository.walmart_draft_publish_failures(),
         "stored": repository.walmart_draft_summary(),
     }
 

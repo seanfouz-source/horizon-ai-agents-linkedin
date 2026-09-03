@@ -624,6 +624,20 @@ class InventoryRepository:
             "latest_updated_at": latest_row["latest_updated_at"],
         }
 
+    def walmart_draft_publish_failures(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT sku, publish_status, publish_error, updated_at
+                FROM walmart_listing_drafts
+                WHERE publish_error IS NOT NULL AND trim(publish_error) != ''
+                ORDER BY updated_at DESC, sku
+                LIMIT ?
+                """,
+                (max(1, min(int(limit), 200)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def set_walmart_draft_status(self, skus: Iterable[str], status: str) -> int:
         selected_skus = [str(sku).strip() for sku in skus if str(sku).strip()]
         if not selected_skus:

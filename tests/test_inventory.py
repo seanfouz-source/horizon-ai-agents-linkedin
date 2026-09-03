@@ -212,6 +212,15 @@ def test_walmart_drafts_are_persisted_and_summarized(tmp_path):
     assert submitted["offer_feed_id"] == "OFFER-1"
     assert repository.walmart_draft_summary()["by_publish_status"] == {"submitted": 1}
 
+    repository.update_walmart_draft_publish_state(
+        ["EBAY-123-GRAY"],
+        "blocked_preflight",
+        error_message="Walmart requires a main image for condition 'Open Box'.",
+    )
+    assert repository.walmart_draft_publish_failures()[0]["publish_error"] == (
+        "Walmart requires a main image for condition 'Open Box'."
+    )
+
 
 def test_walmart_unpublished_job_is_persistent_and_idempotent(tmp_path):
     repository = InventoryRepository(tmp_path / "inventory.db")
