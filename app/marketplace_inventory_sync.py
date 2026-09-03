@@ -421,7 +421,7 @@ class MarketplaceInventorySyncer:
         common_skus = sorted(ebay_by_sku)
         ended_skus = (
             []
-            if ebay_quantity_source == "ebay_repository_cache_fallback"
+            if quantity_sync_paused
             else sorted(
                 (
                     (walmart_skus & set(draft_by_sku))
@@ -486,7 +486,14 @@ class MarketplaceInventorySyncer:
         }
         plans: dict[str, InventorySyncPlan] = {}
         for sku, walmart_quantity_value in walmart_by_sku.items():
-            if sku in excluded_skus:
+            if quantity_sync_paused:
+                plans[sku] = InventorySyncPlan(
+                    target_quantity=walmart_quantity_value,
+                    source="ebay_quantity_unavailable",
+                    update_ebay=False,
+                    update_walmart=False,
+                )
+            elif sku in excluded_skus:
                 zero_plan = choose_ended_listing_sync_plan(
                     walmart_quantity_value,
                     states[sku],
@@ -515,20 +522,12 @@ class MarketplaceInventorySyncer:
                     pending_walmart_at=zero_plan.pending_walmart_at,
                 )
             elif sku in ebay_by_sku:
-                if quantity_sync_paused:
-                    plans[sku] = InventorySyncPlan(
-                        target_quantity=walmart_quantity_value,
-                        source="ebay_quantity_unavailable",
-                        update_ebay=False,
-                        update_walmart=False,
-                    )
-                else:
-                    plans[sku] = choose_inventory_sync_plan(
-                        ebay_by_sku[sku]["quantity"],
-                        walmart_quantity_value,
-                        states[sku],
-                        now=attempted_at,
-                    )
+                plans[sku] = choose_inventory_sync_plan(
+                    ebay_by_sku[sku]["quantity"],
+                    walmart_quantity_value,
+                    states[sku],
+                    now=attempted_at,
+                )
             else:
                 plans[sku] = choose_ended_listing_sync_plan(
                     walmart_quantity_value,

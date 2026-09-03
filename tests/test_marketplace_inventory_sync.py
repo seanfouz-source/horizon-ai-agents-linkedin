@@ -792,6 +792,113 @@ def test_browse_placeholder_one_cannot_reduce_walmart_quantity(tmp_path):
     assert repository.get("PHONE-LIVE").quantity == 5
 
 
+def test_partial_browse_fallback_cannot_zero_an_omitted_walmart_listing(tmp_path):
+    class PartialBrowseFallbackEbayClient(FakeEbayClient):
+        async def fetch_active_inventory_quantities(self, *, limit):
+            raise ValueError("Trading API usage limit exceeded")
+
+        async def fetch_active_browse_inventory_quantities(self, *, limit):
+            assert limit == 200
+            return [
+                {
+                    "sku": "PHONE-LIVE",
+                    "item_id": "100",
+                    "quantity": 1,
+                    "inventory_tracking": "item_id",
+                    "image_urls": [],
+                    "image_complete": False,
+                }
+            ]
+
+    repository = _live_listing_repository(tmp_path)
+    ebay = PartialBrowseFallbackEbayClient()
+    walmart = FakeWalmartClient()
+    walmart.quantities = {"PHONE-LIVE": 5, "PHONE-ENDED": 4}
+
+    result = asyncio.run(MarketplaceInventorySyncer(repository, ebay, walmart).sync_once())
+
+    assert result["ebay_quantity_source"] == "ebay_browse_api_fallback"
+    assert result["quantity_sync_paused"] is True
+    assert result["ended_ebay_skus"] == 0
+    assert result["updated_walmart"] == 0
+    assert result["zeroed_walmart"] == 0
+    assert walmart.inventory_payloads == []
+
+
+def test_browse_fallback_cannot_zero_a_duplicate_walmart_alias(tmp_path):
+    class BrowseFallbackEbayClient(FakeEbayClient):
+        async def fetch_active_inventory_quantities(self, *, limit):
+            raise ValueError("Trading API usage limit exceeded")
+
+        async def fetch_active_browse_inventory_quantities(self, *, limit):
+            assert limit == 200
+            return [
+                {
+                    "sku": "PHONE-LIVE",
+                    "item_id": "100",
+                    "quantity": 1,
+                    "inventory_tracking": "item_id",
+                    "image_urls": [],
+                    "image_complete": False,
+                }
+            ]
+
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    repository.upsert_items(
+        [
+            InventoryItem(
+                sku="PHONE-LIVE",
+                ebay_item_id="100",
+                title="Live Samsung phone",
+                quantity=5,
+                source="ebay-api",
+            )
+        ]
+    )
+    repository.upsert_walmart_drafts(
+        [
+            {
+                "sku": sku,
+                "ebay_item_id": "100",
+                "source_snapshot": {
+                    "sku": "PHONE-LIVE" if sku == "PHONE-LIVE" else "OLD-SKU",
+                    "ebay_item_id": "100",
+                    "title": "Live Samsung phone",
+                    "quantity": 5,
+                },
+            }
+            for sku in ("PHONE-LIVE", "LEGACY-WALMART-SKU")
+        ]
+    )
+    ebay = BrowseFallbackEbayClient()
+    walmart = FakeWalmartClient()
+    walmart.published_items = [
+        {
+            "sku": sku,
+            "published_status": "PUBLISHED",
+            "lifecycle_status": "ACTIVE",
+            "product_type": "Cell Phones",
+            "product_id_type": "GTIN",
+            "product_id": product_id,
+        }
+        for sku, product_id in (
+            ("PHONE-LIVE", "00123456789012"),
+            ("LEGACY-WALMART-SKU", "00123456789029"),
+        )
+    ]
+    walmart.quantities = {"PHONE-LIVE": 5, "LEGACY-WALMART-SKU": 5}
+
+    result = asyncio.run(MarketplaceInventorySyncer(repository, ebay, walmart).sync_once())
+
+    assert result["duplicate_alias_skus"] == 1
+    assert result["quantity_sync_paused"] is True
+    assert result["updated_walmart"] == 0
+    assert result["zeroed_walmart"] == 0
+    assert walmart.inventory_payloads == []
+    alias_state = repository.marketplace_inventory_sync_state("LEGACY-WALMART-SKU")
+    assert alias_state["last_source"] == "ebay_quantity_unavailable"
+
+
 def test_both_ebay_quotas_use_latest_store_snapshot_without_zeroing_missing_items(
     tmp_path,
     monkeypatch,
