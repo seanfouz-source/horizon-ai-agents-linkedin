@@ -936,6 +936,13 @@ def _walmart_original_identifier_retry(draft: dict[str, Any]) -> bool:
     )
 
 
+def _walmart_full_item_retry(draft: dict[str, Any]) -> bool:
+    if str(draft.get("publish_status") or "") != "blocked_offer_error":
+        return False
+    error = str(draft.get("publish_error") or "").lower()
+    return "submit a full setup" in error or "requires a full setup" in error
+
+
 class _WalmartGtinLookupBudget:
     def __init__(self, maximum: int) -> None:
         self.maximum = max(0, int(maximum))
@@ -1683,8 +1690,10 @@ async def _run_walmart_auto_publish_once(
                 if not auto_request.force_retry and not _walmart_publish_retry_due(draft):
                     awaiting_walmart.append(item.sku)
                     continue
-            if publish_status in nonrepeatable_states and not _walmart_original_identifier_retry(
-                draft
+            if (
+                publish_status in nonrepeatable_states
+                and not _walmart_original_identifier_retry(draft)
+                and not _walmart_full_item_retry(draft)
             ):
                 awaiting_walmart.append(item.sku)
                 continue

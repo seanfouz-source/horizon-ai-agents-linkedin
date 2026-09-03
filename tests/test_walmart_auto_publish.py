@@ -593,3 +593,18 @@ def test_original_product_identifier_walmart_error_is_eligible_for_research_retr
     assert not main_module._walmart_original_identifier_retry(
         {"publish_status": "blocked_offer_error", "publish_error": "Generic data error"}
     )
+
+
+def test_walmart_full_setup_error_is_eligible_for_template_retry():
+    assert main_module._walmart_full_item_retry(
+        {
+            "publish_status": "blocked_offer_error",
+            "publish_error": (
+                "An item with the specified Product ID does not exist in our catalog. "
+                "Please submit a Full Setup for the item."
+            ),
+        }
+    )
+    assert not main_module._walmart_full_item_retry(
+        {"publish_status": "blocked_offer_error", "publish_error": "Generic data error"}
+    )
