@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.ebay import EbayClient
@@ -22,6 +22,11 @@ from app.walmart import (
 WALMART_FEED_GRACE_SECONDS = 10 * 60
 EBAY_FULL_IMAGE_SCAN_SECONDS = 60 * 60
 QUANTITY_POLICY_VERSION = 3
+EBAY_QUOTA_COOLDOWN_SECONDS = 15 * 60
+
+
+_ebay_trading_retry_at: datetime | None = None
+_ebay_browse_retry_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -174,34 +179,89 @@ class MarketplaceInventorySyncer:
         self.walmart_client = walmart_client
 
     async def sync_once(self) -> dict[str, Any]:
+        global _ebay_browse_retry_at, _ebay_trading_retry_at
+
         attempted_at = datetime.now(timezone.utc)
         now_iso = attempted_at.isoformat()
         ebay_quantity_source = "ebay_trading_api"
         ebay_quantity_warning: str | None = None
-        try:
-            ebay_rows = await self.ebay_client.fetch_active_inventory_quantities(limit=200)
-        except Exception as trading_exc:
+        ebay_rows: list[dict[str, Any]] = []
+        trading_error: str | None = None
+        if _retry_is_due(_ebay_trading_retry_at, attempted_at):
+            try:
+                ebay_rows = await self.ebay_client.fetch_active_inventory_quantities(
+                    limit=200
+                )
+            except Exception as trading_exc:
+                trading_error = str(trading_exc)
+                if _is_ebay_quota_error(trading_exc):
+                    _ebay_trading_retry_at = attempted_at + timedelta(
+                        seconds=EBAY_QUOTA_COOLDOWN_SECONDS
+                    )
+            else:
+                _ebay_trading_retry_at = None
+        else:
+            trading_error = (
+                "Trading API quota cooldown is active until "
+                f"{_ebay_trading_retry_at.isoformat()}."
+            )
+
+        if not ebay_rows:
             fallback = getattr(
                 self.ebay_client,
                 "fetch_active_browse_inventory_quantities",
                 None,
             )
             if fallback is None:
-                raise
-            try:
-                ebay_rows = await fallback(limit=200)
-            except Exception as browse_exc:
-                raise RuntimeError(
-                    "eBay quantity reads failed through both Trading and Browse APIs: "
-                    f"{trading_exc}; {browse_exc}"
-                ) from browse_exc
+                raise RuntimeError(trading_error or "eBay Trading API returned no rows.")
+            browse_error: str | None = None
+            browse_exc: Exception | None = None
+            if _retry_is_due(_ebay_browse_retry_at, attempted_at):
+                try:
+                    ebay_rows = await fallback(limit=200)
+                except Exception as exc:
+                    browse_exc = exc
+                    browse_error = str(exc)
+                    if _is_ebay_quota_error(exc):
+                        _ebay_browse_retry_at = attempted_at + timedelta(
+                            seconds=EBAY_QUOTA_COOLDOWN_SECONDS
+                        )
+                else:
+                    _ebay_browse_retry_at = None
+            else:
+                browse_error = (
+                    "Browse API quota cooldown is active until "
+                    f"{_ebay_browse_retry_at.isoformat()}."
+                )
+
+            if ebay_rows:
+                ebay_quantity_source = "ebay_browse_api_fallback"
+                ebay_quantity_warning = trading_error
+            else:
+                ebay_rows = self._cached_active_ebay_quantity_rows()
+                if ebay_rows:
+                    ebay_quantity_source = "ebay_repository_cache_fallback"
+                    ebay_quantity_warning = "; ".join(
+                        error for error in (trading_error, browse_error) if error
+                    )
+                else:
+                    detail = "; ".join(
+                        error for error in (trading_error, browse_error) if error
+                    )
+                    if browse_exc is not None:
+                        raise RuntimeError(
+                            "eBay quantity reads failed and no safe active-listing cache "
+                            f"was available: {detail}"
+                        ) from browse_exc
+                    raise RuntimeError(
+                        "eBay quantity reads failed and no safe active-listing cache "
+                        f"was available: {detail}"
+                    )
             if not ebay_rows:
                 raise RuntimeError(
                     "eBay Trading API quantity read failed and the Browse API returned "
                     "no active listings; no marketplace quantities were changed."
-                ) from trading_exc
-            ebay_quantity_source = "ebay_browse_api_fallback"
-            ebay_quantity_warning = str(trading_exc)
+                )
         ebay_by_sku = {
             str(row["sku"]): {
                 "sku": str(row["sku"]),
@@ -320,17 +380,21 @@ class MarketplaceInventorySyncer:
             and (term := self._walmart_exclusion(source_item)) is not None
         }
         common_skus = sorted(ebay_by_sku)
-        ended_skus = sorted(
-            (
-                (walmart_skus & set(draft_by_sku))
-                | {
-                    sku
-                    for sku, item_id in inferred_item_ids.items()
-                    if item_id
-                }
+        ended_skus = (
+            []
+            if ebay_quantity_source == "ebay_repository_cache_fallback"
+            else sorted(
+                (
+                    (walmart_skus & set(draft_by_sku))
+                    | {
+                        sku
+                        for sku, item_id in inferred_item_ids.items()
+                        if item_id
+                    }
+                )
+                - set(ebay_by_sku)
+                - unresolved_alias_skus
             )
-            - set(ebay_by_sku)
-            - unresolved_alias_skus
         )
         sync_skus = sorted(set(common_skus) | set(ended_skus))
         if not sync_skus:
@@ -982,6 +1046,48 @@ class MarketplaceInventorySyncer:
         ).lower()
         return next((term for term in terms if term in searchable), None)
 
+    def _cached_active_ebay_quantity_rows(self) -> list[dict[str, Any]]:
+        cached_items = [
+            item
+            for item in self.repository.ebay_items(limit=200, include_inactive=False)
+            if item.source in {"ebay-store-page", "ebay-browse-api"}
+            and item.ebay_item_id
+        ]
+        if not cached_items:
+            return []
+
+        # Store-page rows from one successful snapshot are written within a few
+        # seconds. Selecting the newest cluster avoids reviving older public rows
+        # that disappeared from a later snapshot.
+        preferred_source = (
+            "ebay-store-page"
+            if any(item.source == "ebay-store-page" for item in cached_items)
+            else "ebay-browse-api"
+        )
+        source_items = [
+            item for item in cached_items if item.source == preferred_source
+        ]
+        latest = max(item.updated_at for item in source_items)
+        snapshot_cutoff = latest - timedelta(minutes=5)
+        rows: list[dict[str, Any]] = []
+        for item in source_items:
+            if item.updated_at < snapshot_cutoff:
+                continue
+            image_urls = item.image_urls or ([item.image_url] if item.image_url else [])
+            row: dict[str, Any] = {
+                "sku": item.sku,
+                "item_id": str(item.ebay_item_id),
+                "quantity": max(0, int(item.quantity)),
+                "inventory_tracking": "item_id",
+                "image_urls": image_urls,
+                "image_complete": False,
+            }
+            if item.price is not None:
+                row["start_price"] = float(item.price)
+                row["currency"] = item.currency or "USD"
+            rows.append(row)
+        return rows
+
 
 def _normalized_image_urls(value: object) -> list[str]:
     raw_values = value if isinstance(value, (list, tuple)) else [value]
@@ -999,6 +1105,23 @@ def _normalized_image_urls(value: object) -> list[str]:
 def _ebay_item_id_from_walmart_sku(sku: str) -> str | None:
     match = re.match(r"^EBAY-(\d{9,15})(?:-|$)", str(sku or "").strip(), re.IGNORECASE)
     return match.group(1) if match else None
+
+
+def _retry_is_due(retry_at: datetime | None, now: datetime) -> bool:
+    return retry_at is None or now >= retry_at
+
+
+def _is_ebay_quota_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "429",
+            "exceeded usage limit",
+            "too many requests",
+            "usage limit on this call",
+        )
+    )
 
 
 def _image_signature(urls: list[str]) -> str:
