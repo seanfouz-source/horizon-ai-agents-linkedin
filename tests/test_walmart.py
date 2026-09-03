@@ -7,6 +7,7 @@ import app.walmart as walmart_module
 from app.models import InventoryItem, WalmartItemOverride
 from app.walmart import (
     WalmartMarketplaceClient,
+    build_full_item_from_catalog_template,
     build_inventory_feed,
     build_item_image_maintenance_feed,
     build_offer_match_preview,
@@ -92,6 +93,86 @@ def test_offer_match_preview_recovers_open_box_from_ebay_listing_data():
 
     assert preview["ready"] == 2
     assert {row["resolved"]["condition"] for row in preview["items"]} == {"Open Box"}
+
+
+def test_full_item_builder_uses_walmart_spec_template_and_ebay_offer_data():
+    item = InventoryItem(
+        sku="EBAY-FULL-1",
+        title="Apple iPhone 13 128GB Blue Open Box",
+        description="Open box and tested.",
+        condition="Open box",
+        price=400,
+        quantity=2,
+        image_url="https://i.ebayimg.com/images/g/primary/s-l1600.jpg",
+        image_urls=[
+            "https://i.ebayimg.com/images/g/primary/s-l1600.jpg",
+            "https://i.ebayimg.com/images/g/secondary/s-l1600.jpg",
+        ],
+        item_specifics={"Brand": "Apple"},
+    )
+    catalog = {
+        "status": "full_item_required",
+        "matched": False,
+        "feed_type": "MP_ITEM",
+        "version": "5.0.20260205-21_38_48-api",
+        "product_type": "Cell Phones",
+        "item_spec_payload": {
+            "MPItemFeedHeader": {
+                "locale": "en",
+                "version": "5.0.20260205-21_38_48-api",
+                "businessUnit": "WALMART_US",
+            },
+            "MPItem": [
+                {
+                    "Orderable": {
+                        "specProductType": "Cell Phones",
+                        "productIdentifiers": {
+                            "productIdType": "GTIN",
+                            "productId": "00194252053164",
+                        },
+                        "electronicsIndicator": "Yes",
+                    },
+                    "Visible": {
+                        "Cell Phones": {
+                            "productName": "Apple iPhone 13 128GB Blue",
+                            "brand": "Apple",
+                            "has_written_warranty": "No",
+                            "isProp65WarningRequired": "No",
+                            "mainImageUrl": "https://i5.walmartimages.com/catalog.jpg",
+                        }
+                    },
+                }
+            ],
+        },
+    }
+
+    payload = build_full_item_from_catalog_template(
+        item,
+        catalog,
+        {
+            "product_id_type": "UPC",
+            "product_id": "194252053164",
+            "shipping_weight_lbs": 1.0,
+            "price": 440.0,
+            "condition": "Open Box",
+        },
+    )
+
+    orderable = payload["MPItem"][0]["Orderable"]
+    visible = payload["MPItem"][0]["Visible"]["Cell Phones"]
+    assert payload["MPItemFeedHeader"]["version"] == "5.0.20260205-21_38_48-api"
+    assert orderable["sku"] == "EBAY-FULL-1"
+    assert orderable["price"] == 440.0
+    assert orderable["ShippingWeight"] == 1.0
+    assert orderable["electronicsIndicator"] == "Yes"
+    assert orderable["productIdentifiers"]["productIdType"] == "GTIN"
+    assert visible["condition"] == "Open Box"
+    assert visible["mainImageUrl"] == item.image_url
+    assert visible["productSecondaryImageURL"] == [
+        item.image_urls[1],
+        "https://i5.walmartimages.com/catalog.jpg",
+    ]
+    assert visible["has_written_warranty"] == "No"
 
 
 def test_offer_match_preview_blocks_missing_identifier_and_weight():
@@ -457,6 +538,39 @@ def test_walmart_client_authenticates_and_submits_match_feed(monkeypatch):
 
     assert result["feed_id"] == "FEED@123"
     assert [request[1] for request in requests] == ["/v3/token", "/v3/feeds"]
+
+
+def test_walmart_client_submits_full_item_as_multipart_feed(monkeypatch):
+    def handler(method, path, headers, **kwargs):
+        request = httpx.Request(method, f"https://marketplace.walmartapis.com{path}", headers=headers)
+        if path == "/v3/token":
+            return httpx.Response(200, json={"access_token": "access-token"}, request=request)
+        if path == "/v3/feeds":
+            assert kwargs["params"] == {"feedType": "MP_ITEM"}
+            filename, content, content_type = kwargs["files"]["file"]
+            assert filename == "walmart-full-item.json"
+            assert content_type == "application/json"
+            assert b'"sku":"EBAY-FULL-1"' in content
+            return httpx.Response(200, json={"feedId": "FULL@123"}, request=request)
+        raise AssertionError(f"Unexpected Walmart request: {method} {path}")
+
+    monkeypatch.setattr(
+        walmart_module.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: FakeAsyncClient(handler, *args, **kwargs),
+    )
+
+    result = asyncio.run(
+        WalmartMarketplaceClient(_settings()).submit_full_item_feed(
+            {
+                "MPItemFeedHeader": {"version": "5.0.20260205-21_38_48-api"},
+                "MPItem": [{"Orderable": {"sku": "EBAY-FULL-1"}}],
+            }
+        )
+    )
+
+    assert result["feed_id"] == "FULL@123"
+    assert result["feed_type"] == "MP_ITEM"
 
 
 def test_walmart_client_submits_item_maintenance_feed(monkeypatch):

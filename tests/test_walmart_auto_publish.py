@@ -17,17 +17,27 @@ class FakeWalmartClient:
 
     def __init__(self):
         self.offer_payloads = []
+        self.full_item_payloads = []
         self.inventory_payloads = []
+        self.catalog_response = {
+            "status": "matched",
+            "matched": True,
+            "feed_type": "MP_ITEM_MATCH",
+        }
 
     async def list_published_items(self, *, limit=1000):
         return []
 
     async def search_catalog(self, product_id_type, product_id, *, response_format="SPEC"):
-        return {"status": "matched", "matched": True, "feed_type": "MP_ITEM_MATCH"}
+        return self.catalog_response
 
     async def submit_offer_match_feed(self, payload):
         self.offer_payloads.append(payload)
         return {"status": "submitted", "feed_id": "OFFER-AUTO"}
+
+    async def submit_full_item_feed(self, payload):
+        self.full_item_payloads.append(payload)
+        return {"status": "submitted", "feed_id": "FULL-AUTO"}
 
     async def submit_inventory_feed(self, payload):
         self.inventory_payloads.append(payload)
@@ -157,6 +167,114 @@ def test_auto_publish_previews_submits_current_inventory_and_does_not_repeat(
     assert len(client.offer_payloads) == 1
     assert len(client.inventory_payloads) == 1
     assert repository.walmart_drafts()[0]["publish_status"] == "submitted"
+
+
+def test_auto_publish_uses_walmart_full_item_template_when_search_requires_it(
+    monkeypatch, tmp_path
+):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    item = InventoryItem(
+        sku="EBAY-AUTO-1",
+        ebay_item_id="123",
+        title="Apple iPhone 13 128GB Blue Open Box",
+        description="Open box and tested.",
+        condition="Open box",
+        price=400,
+        quantity=2,
+        image_url="https://i.ebayimg.com/images/g/primary/s-l1600.jpg",
+        image_urls=["https://i.ebayimg.com/images/g/secondary/s-l1600.jpg"],
+        category="Cell Phones & Smartphones",
+        listing_status="ACTIVE",
+        source="ebay-trading-api",
+        item_specifics={
+            "Brand": "Apple",
+            "Model": "Apple iPhone 13",
+            "UPC": "194252053164",
+            "Shipping Weight": "1 lb",
+        },
+    )
+    repository.upsert_items([item])
+    repository.upsert_walmart_drafts(
+        [
+            {
+                "sku": item.sku,
+                "ebay_item_id": item.ebay_item_id,
+                "source_snapshot": item.model_dump(mode="json"),
+                "prepared_listing": {
+                    "product_identifier": {"type": "UPC", "value": "194252053164"},
+                    "shipping_weight_lbs": 1.0,
+                },
+                "catalog_query": item.title,
+                "catalog_candidates": [],
+                "catalog_status": "candidates_found",
+                "status": "draft_verified_match",
+                "missing_fields": [],
+            }
+        ]
+    )
+    client = FakeWalmartClient()
+    client.catalog_response = {
+        "status": "full_item_required",
+        "matched": False,
+        "feed_type": "MP_ITEM",
+        "version": "5.0.20260205-21_38_48-api",
+        "product_type": "Cell Phones",
+        "item_spec_payload": {
+            "MPItemFeedHeader": {
+                "locale": "en",
+                "version": "5.0.20260205-21_38_48-api",
+                "businessUnit": "WALMART_US",
+            },
+            "MPItem": [
+                {
+                    "Orderable": {
+                        "specProductType": "Cell Phones",
+                        "productIdentifiers": {
+                            "productIdType": "GTIN",
+                            "productId": "00194252053164",
+                        },
+                        "electronicsIndicator": "Yes",
+                    },
+                    "Visible": {
+                        "Cell Phones": {
+                            "productName": "Apple iPhone 13 128GB Blue",
+                            "brand": "Apple",
+                            "has_written_warranty": "No",
+                            "isProp65WarningRequired": "No",
+                        }
+                    },
+                }
+            ],
+        },
+    }
+
+    async def fake_generate(_request):
+        return {"generated": 1}
+
+    monkeypatch.setattr(main_module, "repository", repository)
+    monkeypatch.setattr(main_module, "walmart_client", client)
+    monkeypatch.setattr(main_module, "_generate_walmart_drafts", fake_generate)
+    monkeypatch.setattr(
+        main_module.settings,
+        "walmart_auto_publish_excluded_terms",
+        "don toliver,don oliver,otterbox",
+    )
+
+    submitted = asyncio.run(
+        main_module._run_walmart_auto_publish_once(
+            WalmartAutoPublishRequest(sync_ebay_first=False, confirm=True)
+        )
+    )
+
+    assert submitted["status"] == "submitted"
+    assert submitted["submitted_skus"] == [item.sku]
+    assert submitted["offer_feed_ids"] == ["FULL-AUTO"]
+    assert client.offer_payloads == []
+    assert len(client.full_item_payloads) == 1
+    full_item = client.full_item_payloads[0]["MPItem"][0]
+    assert full_item["Orderable"]["price"] == 440.0
+    assert full_item["Visible"]["Cell Phones"]["condition"] == "Open Box"
+    assert client.inventory_payloads[0]["Inventory"][0]["quantity"]["amount"] == 2
 
 
 def test_auto_publish_excludes_user_blocked_products(monkeypatch):

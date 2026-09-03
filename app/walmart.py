@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import re
 import uuid
@@ -208,6 +209,25 @@ class WalmartMarketplaceClient:
         return {
             "status": "submitted",
             "feed_type": "MP_ITEM_MATCH",
+            "feed_id": feed_id,
+            "correlation_id": response.request.headers.get("WM_QOS.CORRELATION_ID"),
+        }
+
+    async def submit_full_item_feed(self, payload: dict[str, Any]) -> dict[str, Any]:
+        content = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        response = await self._request(
+            "POST",
+            "/v3/feeds",
+            params={"feedType": "MP_ITEM"},
+            files={"file": ("walmart-full-item.json", content, "application/json")},
+        )
+        result = self._json_object(response)
+        feed_id = result.get("feedId")
+        if not isinstance(feed_id, str) or not feed_id:
+            raise WalmartApiError("Walmart accepted the request but did not return a feedId.")
+        return {
+            "status": "submitted",
+            "feed_type": "MP_ITEM",
             "feed_id": feed_id,
             "correlation_id": response.request.headers.get("WM_QOS.CORRELATION_ID"),
         }
@@ -560,6 +580,124 @@ def build_offer_match_preview(
         "items": item_results,
         "payload": payload,
     }
+
+
+def build_full_item_from_catalog_template(
+    item: InventoryItem,
+    catalog: dict[str, Any],
+    resolved: dict[str, Any],
+) -> dict[str, Any]:
+    """Overlay seller-owned offer data on Walmart's current SPEC response template."""
+    raw_template = catalog.get("item_spec_payload")
+    if not isinstance(raw_template, dict):
+        raise ValueError("Walmart did not return an itemSpecPayload template for full item setup.")
+    payload = copy.deepcopy(raw_template)
+    header = payload.get("MPItemFeedHeader")
+    entries = payload.get("MPItem")
+    if not isinstance(header, dict) or not str(header.get("version") or "").strip():
+        raise ValueError("The Walmart item template is missing its required specification version.")
+    if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
+        raise ValueError("The Walmart item template did not contain exactly one MPItem record.")
+
+    catalog_version = str(catalog.get("version") or "").strip()
+    if catalog_version and str(header.get("version") or "").strip() != catalog_version:
+        raise ValueError("The Walmart item template version does not match its catalog response.")
+
+    entry = entries[0]
+    orderable = entry.get("Orderable")
+    visible = entry.get("Visible")
+    if not isinstance(orderable, dict) or not isinstance(visible, dict):
+        raise ValueError("The Walmart item template is missing Orderable or Visible content.")
+
+    product_type = str(
+        catalog.get("product_type") or orderable.get("specProductType") or ""
+    ).strip()
+    if not product_type and len(visible) == 1:
+        product_type = str(next(iter(visible))).strip()
+    product_content = visible.get(product_type)
+    if not product_type or not isinstance(product_content, dict):
+        raise ValueError("The Walmart item template does not contain its product-type content block.")
+
+    product_id_type, product_id = normalize_product_identifier(
+        resolved.get("product_id_type"), resolved.get("product_id")
+    )
+    if not product_id_type or not product_id:
+        raise ValueError("Full item setup requires a valid Walmart product identifier.")
+    template_identifiers = orderable.get("productIdentifiers")
+    if isinstance(template_identifiers, dict):
+        template_type, template_id = normalize_product_identifier(
+            template_identifiers.get("productIdType"), template_identifiers.get("productId")
+        )
+        if (
+            template_type
+            and template_id
+            and _canonical_product_id(template_type, template_id)
+            != _canonical_product_id(product_id_type, product_id)
+        ):
+            raise ValueError("The Walmart template identifier does not match the eBay item identifier.")
+        if not template_type or not template_id:
+            orderable["productIdentifiers"] = {
+                "productIdType": product_id_type,
+                "productId": product_id,
+            }
+    else:
+        orderable["productIdentifiers"] = {
+            "productIdType": product_id_type,
+            "productId": product_id,
+        }
+
+    price = resolved.get("price")
+    shipping_weight = resolved.get("shipping_weight_lbs")
+    condition = str(resolved.get("condition") or "").strip()
+    if not isinstance(price, (int, float)) or price <= 0:
+        raise ValueError("Full item setup requires a positive Walmart price.")
+    if not isinstance(shipping_weight, (int, float)) or shipping_weight <= 0:
+        raise ValueError("Full item setup requires a positive shipping weight.")
+    if condition not in SUPPORTED_CONDITIONS:
+        raise ValueError("Full item setup requires a supported Walmart condition.")
+
+    orderable["sku"] = item.sku
+    orderable["price"] = round(float(price), 2)
+    orderable["ShippingWeight"] = round(float(shipping_weight), 3)
+    orderable.setdefault("specProductType", product_type)
+    product_content["condition"] = condition
+
+    ebay_images = _maintenance_image_urls([item.image_url, *item.image_urls])
+    raw_secondary_images = product_content.get("productSecondaryImageURL")
+    if not isinstance(raw_secondary_images, (list, tuple)):
+        raw_secondary_images = [raw_secondary_images]
+    template_images = _maintenance_image_urls(
+        [product_content.get("mainImageUrl"), *raw_secondary_images]
+    )
+    images = list(dict.fromkeys([*ebay_images, *template_images]))
+    if images:
+        product_content["mainImageUrl"] = images[0]
+        if len(images) > 1:
+            product_content["productSecondaryImageURL"] = images[1:20]
+        else:
+            product_content.pop("productSecondaryImageURL", None)
+    if not str(product_content.get("productName") or "").strip():
+        product_content["productName"] = item.title
+    if not str(product_content.get("shortDescription") or "").strip() and item.description:
+        product_content["shortDescription"] = re.sub(
+            r"\s+", " ", unescape(re.sub(r"<[^>]+>", " ", item.description))
+        ).strip()
+    brand = next(
+        (
+            str(value).strip()
+            for key, value in item.item_specifics.items()
+            if _normalize_key(key) == "brand" and str(value).strip()
+        ),
+        "",
+    )
+    if brand and not str(product_content.get("brand") or "").strip():
+        product_content["brand"] = brand
+
+    return payload
+
+
+def _canonical_product_id(product_id_type: str, product_id: str) -> str:
+    return product_id if product_id_type == "ISBN" else product_id.zfill(14)
 
 
 def build_inventory_feed(items: Iterable[InventoryItem]) -> dict[str, Any]:

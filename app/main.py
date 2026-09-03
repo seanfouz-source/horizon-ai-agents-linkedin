@@ -83,6 +83,7 @@ from app.walmart import (
     WalmartMarketplaceClient,
     build_walmart_catalog_query,
     build_walmart_draft,
+    build_full_item_from_catalog_template,
     build_inventory_feed,
     build_offer_match_preview,
     estimated_shipping_weight_lbs,
@@ -720,6 +721,7 @@ async def _prepare_walmart_import(
     )
     preview["ebay_sync"] = ebay_refresh
     preview["walmart_configured"] = walmart_client.configured
+    preview["full_item_payloads"] = []
 
     if not (force_verify_catalog or import_request.verify_catalog):
         preview["catalog_verification"] = "not_requested"
@@ -730,6 +732,8 @@ async def _prepare_walmart_import(
             detail="WALMART_CLIENT_ID and WALMART_CLIENT_SECRET are required for catalog verification.",
         )
 
+    items_by_sku = {item.sku: item for item in items}
+    full_item_payloads: list[dict[str, Any]] = []
     for item_result in preview["items"]:
         if not item_result["ready"]:
             continue
@@ -742,21 +746,51 @@ async def _prepare_walmart_import(
         except WalmartApiError as exc:
             raise _walmart_http_error(exc) from exc
         item_result["catalog"] = catalog
-        if catalog.get("matched") is False:
+        if catalog.get("matched") is True:
+            item_result["submission_route"] = "MP_ITEM_MATCH"
+        elif (
+            catalog.get("status") == "full_item_required"
+            and isinstance(catalog.get("item_spec_payload"), dict)
+        ):
+            try:
+                full_payload = build_full_item_from_catalog_template(
+                    items_by_sku[str(item_result["sku"])],
+                    catalog,
+                    resolved,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                item_result["ready"] = False
+                item_result["errors"].append(str(exc))
+            else:
+                item_result["submission_route"] = "MP_ITEM"
+                full_item_payloads.append(
+                    {"sku": str(item_result["sku"]), "payload": full_payload}
+                )
+        elif catalog.get("matched") is False:
             item_result["ready"] = False
             item_result["errors"].append(
-                "No published Walmart catalog match was found; this item needs a full MP_ITEM setup."
+                "Walmart did not return either an existing catalog match or a current full-item template."
             )
         elif catalog.get("matched") is None:
             item_result["warnings"].append(str(catalog.get("reason") or "Catalog match was not checked."))
 
+    match_ready_skus = {
+        item["sku"]
+        for item in preview["items"]
+        if item["ready"] and item.get("submission_route") == "MP_ITEM_MATCH"
+    }
     ready_skus = {item["sku"] for item in preview["items"] if item["ready"]}
     preview["payload"]["MPItem"] = [
         entry
         for entry in preview["payload"]["MPItem"]
-        if entry.get("Item", {}).get("sku") in ready_skus
+        if entry.get("Item", {}).get("sku") in match_ready_skus
     ]
-    preview["ready"] = len(preview["payload"]["MPItem"])
+    preview["full_item_payloads"] = full_item_payloads
+    preview["match_ready_skus"] = sorted(match_ready_skus)
+    preview["full_item_ready_skus"] = sorted(
+        row["sku"] for row in full_item_payloads
+    )
+    preview["ready"] = len(ready_skus)
     preview["blocked"] = preview["total"] - preview["ready"]
     preview["catalog_verification"] = "completed"
     return preview
@@ -973,7 +1007,7 @@ async def _resolve_online_product_identifier(
         product_id_type, product_id = normalize_product_identifier(
             cached.get("product_id_type"), cached.get("product_id")
         )
-        if cached.get("verification_status") == "verified" and product_id_type and product_id:
+        if cached.get("verification_status") in {"verified", "full_item_template"} and product_id_type and product_id:
             await budget.record("cache_hit")
             return product_id_type, product_id, {
                 "status": "verified_cache",
@@ -1062,7 +1096,11 @@ async def _resolve_online_product_identifier(
             "reason": f"The online identifier could not be checked against Walmart: {exc}",
         }
 
-    if catalog.get("matched") is not True:
+    full_item_template = (
+        catalog.get("status") == "full_item_required"
+        and isinstance(catalog.get("item_spec_payload"), dict)
+    )
+    if catalog.get("matched") is not True and not full_item_template:
         await budget.record("unresolved")
         catalog_status = str(catalog.get("status") or "not_matched")
         reason = (
@@ -1088,10 +1126,11 @@ async def _resolve_online_product_identifier(
         }
 
     await budget.record("verified")
+    verification_status = "full_item_template" if full_item_template else "verified"
     repository.upsert_walmart_product_identifier_cache(
         item.sku,
         source_fingerprint=fingerprint,
-        verification_status="verified",
+        verification_status=verification_status,
         product_id_type=researched.product_id_type,
         product_id=researched.product_id,
         source_urls=researched.source_urls,
@@ -1100,9 +1139,10 @@ async def _resolve_online_product_identifier(
         next_lookup_at=None,
     )
     return researched.product_id_type, researched.product_id, {
-        "status": "verified",
+        "status": verification_status,
         "source_urls": researched.source_urls,
         "matched_product": researched.matched_product,
+        "submission_route": "MP_ITEM" if full_item_template else "MP_ITEM_MATCH",
     }
 
 
@@ -1305,6 +1345,57 @@ def _apply_walmart_inventory_feed_results(
             error_message=result.get("error_message") or None,
         )
     return states
+
+
+def _group_walmart_full_item_payloads(
+    payload_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for row in payload_rows:
+        sku = str(row.get("sku") or "").strip()
+        payload = row.get("payload")
+        if not sku or not isinstance(payload, dict):
+            continue
+        header = payload.get("MPItemFeedHeader")
+        entries = payload.get("MPItem")
+        if not isinstance(header, dict) or not isinstance(entries, list) or len(entries) != 1:
+            continue
+        key = json.dumps(header, sort_keys=True, separators=(",", ":"))
+        group = groups.setdefault(
+            key,
+            {
+                "feed_type": "MP_ITEM",
+                "skus": [],
+                "payload": {"MPItemFeedHeader": header, "MPItem": []},
+            },
+        )
+        group["skus"].append(sku)
+        group["payload"]["MPItem"].append(entries[0])
+    return list(groups.values())
+
+
+def _walmart_offer_groups_from_preflight(
+    preflight: dict[str, Any],
+) -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    match_ready_skus = set(preflight.get("match_ready_skus") or [])
+    match_entries = [
+        entry
+        for entry in (preflight.get("payload") or {}).get("MPItem", [])
+        if entry.get("Item", {}).get("sku") in match_ready_skus
+    ]
+    if match_entries:
+        groups.append(
+            {
+                "feed_type": "MP_ITEM_MATCH",
+                "skus": sorted(match_ready_skus),
+                "payload": {**preflight["payload"], "MPItem": match_entries},
+            }
+        )
+    groups.extend(
+        _group_walmart_full_item_payloads(preflight.get("full_item_payloads") or [])
+    )
+    return groups
 
 
 async def _reconcile_walmart_auto_publish_feeds(
@@ -1707,63 +1798,76 @@ async def _run_walmart_auto_publish_once(
             walmart_auto_publish_status = base_result
             return base_result
 
-        ready_set = set(ready_skus)
-        offer_entries = [
-            entry
-            for entry in preflight["payload"]["MPItem"]
-            if entry.get("Item", {}).get("sku") in ready_set
-        ]
-        offer_payload = {**preflight["payload"], "MPItem": offer_entries}
+        offer_groups = _walmart_offer_groups_from_preflight(preflight)
         repository.update_walmart_draft_publish_state(
             ready_skus,
             "submitting_offer",
             increment_attempts=True,
         )
-        try:
-            offer_submission = await walmart_client.submit_offer_match_feed(offer_payload)
-        except WalmartApiError as exc:
+        submitted_offer_groups: list[dict[str, Any]] = []
+        offer_submission_errors: dict[str, str] = {}
+        for group in offer_groups:
+            group_skus = [str(sku) for sku in group["skus"]]
+            try:
+                if group["feed_type"] == "MP_ITEM":
+                    submission = await walmart_client.submit_full_item_feed(group["payload"])
+                else:
+                    submission = await walmart_client.submit_offer_match_feed(group["payload"])
+            except WalmartApiError as exc:
+                repository.update_walmart_draft_publish_state(
+                    group_skus, "offer_failed", error_message=str(exc)
+                )
+                offer_submission_errors[",".join(group_skus)] = str(exc)
+                continue
+            feed_id = str(submission["feed_id"])
             repository.update_walmart_draft_publish_state(
-                ready_skus, "offer_failed", error_message=str(exc)
+                group_skus,
+                "offer_submitted_inventory_pending",
+                offer_feed_id=feed_id,
             )
+            submitted_offer_groups.append({**group, "feed_id": feed_id})
+
+        if not submitted_offer_groups:
             walmart_auto_publish_status = {
                 **base_result,
                 "status": "offer_failed",
-                "message": str(exc),
+                "offer_submission_errors": offer_submission_errors,
+                "message": "Walmart rejected every item-setup feed submission.",
             }
-            raise _walmart_http_error(exc) from exc
+            return walmart_auto_publish_status
 
-        offer_feed_id = str(offer_submission["feed_id"])
-        repository.update_walmart_draft_publish_state(
-            ready_skus,
-            "offer_submitted_inventory_pending",
-            offer_feed_id=offer_feed_id,
+        async def wait_for_offer_group(group: dict[str, Any]) -> dict[str, Any]:
+            try:
+                feed = await _wait_for_walmart_feed(str(group["feed_id"]))
+            except WalmartApiError as exc:
+                return {**group, "wait_error": str(exc), "feed": None}
+            return {**group, "wait_error": None, "feed": feed}
+
+        completed_offer_groups = await asyncio.gather(
+            *(wait_for_offer_group(group) for group in submitted_offer_groups)
         )
-        try:
-            offer_feed = await _wait_for_walmart_feed(offer_feed_id)
-        except WalmartApiError as exc:
-            walmart_auto_publish_status = {
-                **base_result,
-                "status": "offer_submitted_inventory_pending",
-                "offer_feed_id": offer_feed_id,
-                "message": str(exc),
-            }
-            return walmart_auto_publish_status
+        offer_states: dict[str, str] = {}
+        processing_offer_skus: list[str] = []
+        offer_wait_errors: dict[str, str] = {}
+        for group in completed_offer_groups:
+            group_skus = {str(sku) for sku in group["skus"]}
+            if group.get("wait_error"):
+                processing_offer_skus.extend(sorted(group_skus))
+                offer_wait_errors[str(group["feed_id"])] = str(group["wait_error"])
+                continue
+            offer_feed = group.get("feed") or {}
+            if str(offer_feed.get("feedStatus") or "").upper() != "PROCESSED":
+                processing_offer_skus.extend(sorted(group_skus))
+                repository.update_walmart_draft_publish_state(
+                    group_skus,
+                    "processing",
+                    offer_feed_id=str(group["feed_id"]),
+                )
+                continue
+            offer_states.update(_apply_walmart_offer_feed_results(offer_feed, group_skus))
 
-        if str(offer_feed.get("feedStatus") or "").upper() != "PROCESSED":
-            repository.update_walmart_draft_publish_state(
-                ready_skus,
-                "processing",
-                offer_feed_id=offer_feed_id,
-            )
-            walmart_auto_publish_status = {
-                **base_result,
-                "status": "processing",
-                "offer_feed_id": offer_feed_id,
-                "message": "The Walmart offer feed is still processing; inventory was not sent yet.",
-            }
-            return walmart_auto_publish_status
-
-        offer_states = _apply_walmart_offer_feed_results(offer_feed, ready_set)
+        offer_feed_ids = [str(group["feed_id"]) for group in submitted_offer_groups]
+        offer_feed_id = offer_feed_ids[0] if offer_feed_ids else None
         accepted_offer_skus = [
             sku
             for sku in ready_skus
@@ -1772,10 +1876,18 @@ async def _run_walmart_auto_publish_once(
         if not accepted_offer_skus:
             walmart_auto_publish_status = {
                 **base_result,
-                "status": "offer_processed_no_success",
+                "status": "processing" if processing_offer_skus else "offer_processed_no_success",
                 "offer_feed_id": offer_feed_id,
+                "offer_feed_ids": offer_feed_ids,
                 "offer_states": offer_states,
-                "message": "Walmart did not accept any offer, so no inventory feed was sent.",
+                "processing_offer_skus": processing_offer_skus,
+                "offer_submission_errors": offer_submission_errors,
+                "offer_wait_errors": offer_wait_errors,
+                "message": (
+                    "Walmart is still processing item setup; inventory was not sent yet."
+                    if processing_offer_skus
+                    else "Walmart did not accept any offer, so no inventory feed was sent."
+                ),
             }
             return walmart_auto_publish_status
 
@@ -1792,13 +1904,13 @@ async def _run_walmart_auto_publish_once(
             repository.update_walmart_draft_publish_state(
                 accepted_offer_skus,
                 "offer_processed_inventory_pending",
-                offer_feed_id=offer_feed_id,
                 error_message=str(exc),
             )
             walmart_auto_publish_status = {
                 **base_result,
                 "status": "offer_submitted_inventory_pending",
                 "offer_feed_id": offer_feed_id,
+                "offer_feed_ids": offer_feed_ids,
                 "message": str(exc),
             }
             raise _walmart_http_error(exc) from exc
@@ -1807,7 +1919,6 @@ async def _run_walmart_auto_publish_once(
         repository.update_walmart_draft_publish_state(
             accepted_offer_skus,
             "offer_processed_inventory_pending",
-            offer_feed_id=offer_feed_id,
             inventory_feed_id=inventory_feed_id,
         )
         try:
@@ -1817,6 +1928,7 @@ async def _run_walmart_auto_publish_once(
                 **base_result,
                 "status": "offer_processed_inventory_pending",
                 "offer_feed_id": offer_feed_id,
+                "offer_feed_ids": offer_feed_ids,
                 "inventory_feed_id": inventory_feed_id,
                 "offer_states": offer_states,
                 "message": str(exc),
@@ -1841,9 +1953,13 @@ async def _run_walmart_auto_publish_once(
             "submitted_skus": submitted_skus,
             "pending_inventory_skus": pending_inventory_skus,
             "offer_feed_id": offer_feed_id,
+            "offer_feed_ids": offer_feed_ids,
             "inventory_feed_id": inventory_feed_id,
             "offer_states": offer_states,
             "inventory_states": inventory_states,
+            "processing_offer_skus": processing_offer_skus,
+            "offer_submission_errors": offer_submission_errors,
+            "offer_wait_errors": offer_wait_errors,
             "message": (
                 "Walmart inventory was sent only for offers that its feed processor accepted."
             ),
@@ -1853,6 +1969,7 @@ async def _run_walmart_auto_publish_once(
             "configured": True,
             "last_submission": {
                 "offer_feed_id": offer_feed_id,
+                "offer_feed_ids": offer_feed_ids,
                 "inventory_feed_id": inventory_feed_id,
             },
             "submitted_items": len(submitted_skus),
@@ -1950,7 +2067,13 @@ async def _submit_unpublished_batch_once(batch_id: str) -> dict[str, Any]:
         ),
         force_verify_catalog=True,
     )
-    ready_skus = [str(item["sku"]) for item in preflight["items"] if item.get("ready")]
+    ready_skus = [str(sku) for sku in preflight.get("match_ready_skus") or []]
+    if "match_ready_skus" not in preflight:
+        ready_skus = [
+            str(item["sku"])
+            for item in preflight.get("items") or []
+            if item.get("ready")
+        ]
     skipped_skus = sorted(set(skipped_skus) | (set(candidate_skus) - set(ready_skus)))
     if not ready_skus:
         walmart_unpublished_status = repository.upsert_walmart_unpublished_job(
@@ -2454,8 +2577,8 @@ async def walmart_status(
         "configured": walmart_client.configured,
         "environment": "sandbox" if "sandbox" in walmart_client.base_url.lower() else "production",
         "market": settings.walmart_market,
-        "offer_feed_type": "MP_ITEM_MATCH",
-        "offer_spec_version": "4.2",
+        "offer_feed_types": ["MP_ITEM_MATCH", "MP_ITEM"],
+        "offer_spec_source": "Walmart catalog search responseFormat=SPEC",
         "last_sync": walmart_sync_status,
     }
     if test_auth:
@@ -2475,7 +2598,8 @@ def walmart_drafts_summary() -> dict[str, Any]:
         "walmart_feed_submitted": walmart_auto_publish_status.get("status") == "submitted",
         "note": (
             "Walmart Marketplace APIs do not expose Seller Center draft creation. "
-            "The automatic publisher submits only unique, exact catalog matches and leaves ambiguous records staged."
+            "The automatic publisher uses setup-by-match for existing catalog items and "
+            "Walmart's returned current-spec template for full item setup. Ambiguous records stay staged."
         ),
     }
 
@@ -2657,31 +2781,55 @@ async def submit_walmart_import(
                 "preflight": preview,
             },
         )
-    try:
-        submission = await walmart_client.submit_offer_match_feed(preview["payload"])
-    except WalmartApiError as exc:
+    offer_groups = _walmart_offer_groups_from_preflight(preview)
+    submissions: list[dict[str, Any]] = []
+    submission_errors: list[dict[str, Any]] = []
+    for group in offer_groups:
+        try:
+            if group["feed_type"] == "MP_ITEM":
+                submission = await walmart_client.submit_full_item_feed(group["payload"])
+            else:
+                submission = await walmart_client.submit_offer_match_feed(group["payload"])
+        except WalmartApiError as exc:
+            submission_errors.append(
+                {"feed_type": group["feed_type"], "skus": group["skus"], "message": str(exc)}
+            )
+        else:
+            submissions.append({**submission, "skus": group["skus"]})
+    if not submissions:
+        message = (
+            submission_errors[0]["message"]
+            if submission_errors
+            else "No Walmart item-setup payloads were generated."
+        )
         walmart_sync_status = {
             "status": "failed",
             "configured": walmart_client.configured,
             "last_submission": None,
-            "message": str(exc),
+            "message": message,
             "last_attempt_at": datetime.now(timezone.utc).isoformat(),
         }
-        raise _walmart_http_error(exc) from exc
+        raise HTTPException(status_code=502, detail=message)
 
     walmart_sync_status = {
-        "status": "submitted",
+        "status": "submitted" if not submission_errors else "partially_submitted",
         "configured": True,
-        "last_submission": submission,
-        "submitted_items": preview["ready"],
+        "last_submission": submissions,
+        "submitted_items": sum(len(submission["skus"]) for submission in submissions),
+        "submission_errors": submission_errors,
         "last_attempt_at": datetime.now(timezone.utc).isoformat(),
     }
+    first_submission = submissions[0]
     return {
-        **submission,
-        "submitted_items": preview["ready"],
+        "status": walmart_sync_status["status"],
+        "feed_id": first_submission["feed_id"],
+        "feed_type": first_submission["feed_type"],
+        "submissions": submissions,
+        "submission_errors": submission_errors,
+        "submitted_items": walmart_sync_status["submitted_items"],
         "blocked_items": preview["blocked"],
         "items": preview["items"],
-        "next_step": f"Check /walmart/feeds/{submission['feed_id']} until the feed is PROCESSED.",
+        "next_step": "Check each returned feed ID until every feed is PROCESSED.",
     }
 
 
