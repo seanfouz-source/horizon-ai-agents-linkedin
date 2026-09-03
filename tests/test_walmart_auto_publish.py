@@ -70,8 +70,9 @@ def test_startup_open_box_retry_runs_once_without_refreshing_ebay(
 
     assert len(requests) == 1
     assert requests[0].confirm is True
-    assert requests[0].force_retry is True
+    assert requests[0].force_retry is False
     assert requests[0].sync_ebay_first is False
+    assert requests[0].gtin_lookup_max_items == 100
     marker = repository.service_run_marker(main_module.WALMART_OPEN_BOX_RETRY_MARKER)
     assert marker["status"] == "complete"
     assert marker["result"]["submitted_items"] == 4

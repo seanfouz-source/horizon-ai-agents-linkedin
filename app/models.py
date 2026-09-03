@@ -87,6 +87,7 @@ class WalmartDraftGenerateRequest(BaseModel):
 
 class WalmartAutoPublishRequest(BaseModel):
     max_items: int = Field(default=200, ge=1, le=200)
+    gtin_lookup_max_items: int | None = Field(default=None, ge=0, le=200)
     sync_ebay_first: bool = True
     confirm: bool = False
     force_retry: bool = False

@@ -180,8 +180,9 @@ LISTING_PHOTO_FILENAMES = {
     "PHOTO-2026-07-24-13-19-13.jpg",
     "PHOTO-2026-07-24-13-19-38.jpg",
 }
-WALMART_OPEN_BOX_RETRY_MARKER = "walmart-open-box-publish-2026-09-02-v1"
+WALMART_OPEN_BOX_RETRY_MARKER = "walmart-missing-listings-2026-09-02-v2"
 WALMART_OPEN_BOX_RETRY_DELAY_SECONDS = 60
+WALMART_OPEN_BOX_RETRY_GTIN_LIMIT = 100
 
 
 def verify_secret(x_horizon_secret: str | None, query_secret: str | None = None) -> None:
@@ -484,9 +485,10 @@ async def _startup_walmart_open_box_retry() -> None:
         result = await _run_walmart_auto_publish_once(
             WalmartAutoPublishRequest(
                 max_items=max(1, min(int(settings.walmart_auto_publish_batch_size), 200)),
+                gtin_lookup_max_items=WALMART_OPEN_BOX_RETRY_GTIN_LIMIT,
                 sync_ebay_first=False,
                 confirm=True,
-                force_retry=True,
+                force_retry=False,
             )
         )
     except asyncio.CancelledError:
@@ -1600,9 +1602,12 @@ async def _run_walmart_auto_publish_once(
         )
 
         enrichment_semaphore = asyncio.Semaphore(4)
-        gtin_lookup_budget = _WalmartGtinLookupBudget(
-            settings.walmart_gtin_lookup_max_per_run
+        gtin_lookup_limit = (
+            auto_request.gtin_lookup_max_items
+            if auto_request.gtin_lookup_max_items is not None
+            else settings.walmart_gtin_lookup_max_per_run
         )
+        gtin_lookup_budget = _WalmartGtinLookupBudget(gtin_lookup_limit)
 
         async def resolve_one(
             item: InventoryItem,
@@ -2578,6 +2583,7 @@ def walmart_auto_publish_current_status() -> dict[str, Any]:
             for term in str(settings.walmart_auto_publish_excluded_terms or "").split(",")
             if term.strip()
         ],
+        "startup_retry": repository.service_run_marker(WALMART_OPEN_BOX_RETRY_MARKER),
         "stored": repository.walmart_draft_summary(),
     }
 
