@@ -50,6 +50,7 @@ from app.models import (
     SocialDraftBatch,
     SocialDraftRequest,
     WalmartAutoPublishRequest,
+    WalmartCatalogRepairRequest,
     WalmartImportRequest,
     WalmartDraftGenerateRequest,
     WalmartInventorySyncRequest,
@@ -92,6 +93,7 @@ from app.walmart import (
     normalize_product_identifier,
     plausible_catalog_candidates,
     select_verified_catalog_match,
+    walmart_price,
 )
 from app.walmart_public_data import PUBLIC_CATALOG_IDENTIFIERS
 from app.walmart_feed_reconciliation import (
@@ -2649,6 +2651,142 @@ async def walmart_catalog_items(
         )
     except WalmartApiError as exc:
         raise _walmart_http_error(exc) from exc
+
+
+@app.post("/walmart/catalog/repair-apple-errors")
+async def repair_walmart_apple_catalog_errors(
+    repair_request: WalmartCatalogRepairRequest,
+    request: Request,
+    x_horizon_secret: str | None = Header(default=None),
+) -> dict[str, Any]:
+    verify_secret(x_horizon_secret, request.query_params.get("secret"))
+    if not walmart_client.configured:
+        raise HTTPException(
+            status_code=503,
+            detail="WALMART_CLIENT_ID and WALMART_CLIENT_SECRET are not configured.",
+        )
+    try:
+        catalog_response = await walmart_client.list_catalog_items(limit=1000)
+    except WalmartApiError as exc:
+        raise _walmart_http_error(exc) from exc
+
+    raw_items: object = catalog_response.get("ItemResponse") or catalog_response.get("items") or []
+    if isinstance(raw_items, dict):
+        raw_items = raw_items.get("Item") or raw_items.get("items") or []
+    catalog_items = raw_items if isinstance(raw_items, list) else []
+    requested_skus = {str(sku).strip() for sku in repair_request.skus if str(sku).strip()}
+    apple_errors = [
+        item
+        for item in catalog_items
+        if isinstance(item, dict)
+        and str(item.get("publishedStatus") or "").upper() == "SYSTEM_PROBLEM"
+        and any(
+            marker in str(item.get("productName") or "").lower()
+            for marker in ("apple", "iphone")
+        )
+        and (not requested_skus or str(item.get("sku") or "") in requested_skus)
+    ][: repair_request.max_items]
+    catalog_skus = [str(item.get("sku") or "").strip() for item in apple_errors]
+    drafts = {
+        str(draft.get("sku") or "").strip(): draft
+        for draft in repository.walmart_drafts(catalog_skus, limit=repair_request.max_items)
+    }
+    inventory_rows = {
+        item.sku: item
+        for item in repository.ebay_items(
+            catalog_skus,
+            limit=repair_request.max_items,
+            include_inactive=True,
+        )
+    }
+
+    payload_rows: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+    for catalog_item in apple_errors:
+        walmart_sku = str(catalog_item.get("sku") or "").strip()
+        source_item = inventory_rows.get(walmart_sku)
+        draft = drafts.get(walmart_sku) or {}
+        source_snapshot = draft.get("source_snapshot")
+        if isinstance(source_snapshot, dict):
+            try:
+                source_item = InventoryItem.model_validate(source_snapshot)
+            except (TypeError, ValueError):
+                pass
+        if source_item is None:
+            results.append(
+                {"sku": walmart_sku, "ready": False, "reason": "No stored eBay source snapshot was found."}
+            )
+            continue
+
+        product_id_type = "GTIN" if catalog_item.get("gtin") else "UPC"
+        product_id = str(catalog_item.get("gtin") or catalog_item.get("upc") or "").strip()
+        price = walmart_price(source_item.price, settings.walmart_price_markup_percent)
+        resolved = {
+            "product_id_type": product_id_type,
+            "product_id": product_id,
+            "shipping_weight_lbs": settings.walmart_default_shipping_weight_lbs,
+            "condition": "Open Box",
+            "price": price,
+            "quantity": max(1, int(source_item.quantity or 0)),
+            "main_image_url": source_item.image_url,
+        }
+        try:
+            spec = await walmart_client.search_catalog(product_id_type, product_id)
+            if spec.get("matched") is not True:
+                raise ValueError("Walmart did not return a setup-by-match template for its current catalog GTIN.")
+            walmart_item = source_item.model_copy(update={"sku": walmart_sku, "condition": "Open Box"})
+            payload = build_offer_match_from_catalog_template(walmart_item, spec, resolved)
+        except (WalmartApiError, KeyError, TypeError, ValueError) as exc:
+            results.append({"sku": walmart_sku, "ready": False, "reason": str(exc)})
+            continue
+        payload_rows.append({"sku": walmart_sku, "payload": payload})
+        results.append(
+            {
+                "sku": walmart_sku,
+                "ready": True,
+                "source_ebay_item_id": source_item.ebay_item_id,
+                "product_id_type": product_id_type,
+                "product_id": product_id,
+                "price": price,
+                "condition": "Open Box",
+            }
+        )
+
+    groups = _group_walmart_match_item_payloads(payload_rows)
+    submissions: list[dict[str, Any]] = []
+    if repair_request.confirm:
+        for group in groups:
+            try:
+                submission = await walmart_client.submit_offer_match_feed(group["payload"])
+            except WalmartApiError as exc:
+                for sku in group["skus"]:
+                    repository.update_walmart_draft_publish_state(
+                        [sku], "offer_failed", error_message=str(exc)
+                    )
+                submissions.append(
+                    {"status": "failed", "skus": group["skus"], "message": str(exc)}
+                )
+            else:
+                repository.update_walmart_draft_publish_state(
+                    group["skus"],
+                    "offer_submitted_inventory_pending",
+                    offer_feed_id=str(submission["feed_id"]),
+                    increment_attempts=True,
+                )
+                submissions.append({**submission, "skus": group["skus"]})
+
+    return {
+        "status": "submitted" if repair_request.confirm and submissions else "previewed",
+        "apple_error_items_found": len(apple_errors),
+        "ready": len(payload_rows),
+        "blocked": len(apple_errors) - len(payload_rows),
+        "items": results,
+        "submissions": submissions,
+        "policy_note": (
+            "Template resubmission can correct item-data errors, but Walmart may retain an "
+            "Intellectual Property policy block until its separate review is satisfied."
+        ),
+    }
 
 
 @app.get("/walmart/drafts/summary")

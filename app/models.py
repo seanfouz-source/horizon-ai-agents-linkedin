@@ -83,6 +83,12 @@ class WalmartOfferFeedReconcileRequest(BaseModel):
     confirm: bool = False
 
 
+class WalmartCatalogRepairRequest(BaseModel):
+    skus: list[str] = Field(default_factory=list, max_length=200)
+    max_items: int = Field(default=100, ge=1, le=200)
+    confirm: bool = False
+
+
 class WalmartDraftGenerateRequest(BaseModel):
     skus: list[str] = Field(default_factory=list)
     max_items: int = Field(default=200, ge=1, le=200)
