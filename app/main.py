@@ -1530,7 +1530,7 @@ async def _run_walmart_auto_publish_once(
                 continue
             publish_status = str(draft.get("publish_status") or "")
             if publish_status in {"retryable_offer_error", "compliance_review"}:
-                if not _walmart_publish_retry_due(draft):
+                if not auto_request.force_retry and not _walmart_publish_retry_due(draft):
                     awaiting_walmart.append(item.sku)
                     continue
             if publish_status in nonrepeatable_states and not _walmart_original_identifier_retry(
@@ -1630,6 +1630,7 @@ async def _run_walmart_auto_publish_once(
             "status": "previewed" if not auto_request.confirm else "no_ready_items",
             "enabled": settings.walmart_auto_publish_enabled,
             "confirm": auto_request.confirm,
+            "force_retry": auto_request.force_retry,
             "generated_drafts": int(generation.get("generated") or 0),
             "active_ebay_items": len(active_items),
             "published_walmart_items": len(published_skus),

@@ -89,6 +89,7 @@ class WalmartAutoPublishRequest(BaseModel):
     max_items: int = Field(default=200, ge=1, le=200)
     sync_ebay_first: bool = True
     confirm: bool = False
+    force_retry: bool = False
 
 
 class CustomerQuestion(BaseModel):
