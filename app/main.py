@@ -2724,7 +2724,10 @@ async def repair_walmart_apple_catalog_errors(
         resolved = {
             "product_id_type": product_id_type,
             "product_id": product_id,
-            "shipping_weight_lbs": settings.walmart_default_shipping_weight_lbs,
+            "shipping_weight_lbs": (
+                settings.walmart_default_shipping_weight_lbs
+                or estimated_shipping_weight_lbs(source_item)
+            ),
             "condition": "Open Box",
             "price": price,
             "quantity": max(1, int(source_item.quantity or 0)),
