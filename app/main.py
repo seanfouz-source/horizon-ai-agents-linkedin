@@ -180,9 +180,9 @@ LISTING_PHOTO_FILENAMES = {
     "PHOTO-2026-07-24-13-19-13.jpg",
     "PHOTO-2026-07-24-13-19-38.jpg",
 }
-WALMART_OPEN_BOX_RETRY_MARKER = "walmart-missing-listings-2026-09-02-v2"
+WALMART_OPEN_BOX_RETRY_MARKER = "walmart-new-other-condition-2026-09-02-v3"
 WALMART_OPEN_BOX_RETRY_DELAY_SECONDS = 60
-WALMART_OPEN_BOX_RETRY_GTIN_LIMIT = 100
+WALMART_OPEN_BOX_RETRY_GTIN_LIMIT = 0
 
 
 def verify_secret(x_horizon_secret: str | None, query_secret: str | None = None) -> None:

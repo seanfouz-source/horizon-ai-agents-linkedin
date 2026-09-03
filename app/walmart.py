@@ -1188,6 +1188,9 @@ def _walmart_condition(value: str | None) -> str | None:
         # This seller is approved for Walmart's Open Box condition lane, so keep
         # eBay's Open box condition exact instead of changing its program grade.
         "open box": "Open Box",
+        "new_other": "Open Box",
+        "new other": "Open Box",
+        "1500": "Open Box",
         "remanufactured": "Remanufactured",
         "pre-owned: fair": "Pre-Owned: Fair",
         "pre-owned: good": "Pre-Owned: Good",

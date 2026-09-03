@@ -42,6 +42,25 @@ def test_offer_match_preview_maps_ebay_fields():
     assert offer["price"] == 577.5
 
 
+def test_offer_match_preview_maps_ebay_open_box_api_codes():
+    for source_condition in ("NEW_OTHER", "1500"):
+        item = InventoryItem(
+            sku=f"EBAY-{source_condition}",
+            title="Samsung Galaxy S25 128GB",
+            condition=source_condition,
+            price=525,
+            quantity=2,
+            image_url="https://i.ebayimg.com/images/g/demo/s-l1600.jpg",
+            item_specifics={"UPC": "887276900124", "Shipping Weight": "24 oz"},
+            source="ebay-api",
+        )
+
+        preview = build_offer_match_preview([item])
+
+        assert preview["ready"] == 1
+        assert preview["items"][0]["resolved"]["condition"] == "Open Box"
+
+
 def test_offer_match_preview_blocks_missing_identifier_and_weight():
     item = InventoryItem(
         sku="EBAY-123",
