@@ -133,6 +133,69 @@ def test_ebay_client_falls_back_to_browse_api_and_selects_primary_image(monkeypa
     assert items[0].item_specifics["Shipping"] == "Free Shipping"
 
 
+def test_ebay_lightweight_browse_quantity_fallback_uses_one_search_call(monkeypatch):
+    calls = []
+
+    def handler(path, params):
+        calls.append(path)
+        request = httpx.Request("GET", f"https://api.ebay.com{path}")
+        assert path == "/buy/browse/v1/item_summary/search"
+        assert params["filter"] == "sellers:{exactspec-electronics}"
+        return httpx.Response(
+            200,
+            json={
+                "itemSummaries": [
+                    {
+                        "itemId": "v1|123456789012|0",
+                        "legacyItemId": "123456789012",
+                        "price": {"value": "525.00", "currency": "USD"},
+                        "image": {
+                            "imageUrl": "https://i.ebayimg.com/images/g/demo/s-l500.jpg"
+                        },
+                        "estimatedAvailabilities": [
+                            {
+                                "estimatedAvailabilityStatus": "IN_STOCK",
+                                "estimatedAvailableQuantity": 4,
+                            }
+                        ],
+                    }
+                ],
+                "total": 1,
+            },
+            request=request,
+        )
+
+    monkeypatch.setattr(
+        ebay_module.httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: FakeAsyncClient(handler),
+    )
+    settings = SimpleNamespace(
+        ebay_access_token="token",
+        ebay_marketplace_id="EBAY_US",
+        ebay_seller_username="exactspec-electronics",
+        ebay_browse_search_query=" ",
+    )
+
+    rows = asyncio.run(
+        EbayClient(settings).fetch_active_browse_inventory_quantities(limit=200)
+    )
+
+    assert calls == ["/buy/browse/v1/item_summary/search"]
+    assert rows == [
+        {
+            "sku": "EBAY-123456789012",
+            "item_id": "123456789012",
+            "quantity": 4,
+            "inventory_tracking": "item_id",
+            "image_urls": ["https://i.ebayimg.com/images/g/demo/s-l500.jpg"],
+            "image_complete": False,
+            "start_price": 525.0,
+            "currency": "USD",
+        }
+    ]
+
+
 def test_ebay_browse_api_expands_item_group_and_recovers_catalog_gtins(monkeypatch):
     def handler(path, params):
         request = httpx.Request("GET", f"https://api.ebay.com{path}")

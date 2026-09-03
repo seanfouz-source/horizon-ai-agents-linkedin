@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -20,7 +21,7 @@ from app.walmart import (
 
 WALMART_FEED_GRACE_SECONDS = 10 * 60
 EBAY_FULL_IMAGE_SCAN_SECONDS = 60 * 60
-QUANTITY_POLICY_VERSION = 2
+QUANTITY_POLICY_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -175,7 +176,32 @@ class MarketplaceInventorySyncer:
     async def sync_once(self) -> dict[str, Any]:
         attempted_at = datetime.now(timezone.utc)
         now_iso = attempted_at.isoformat()
-        ebay_rows = await self.ebay_client.fetch_active_inventory_quantities(limit=200)
+        ebay_quantity_source = "ebay_trading_api"
+        ebay_quantity_warning: str | None = None
+        try:
+            ebay_rows = await self.ebay_client.fetch_active_inventory_quantities(limit=200)
+        except Exception as trading_exc:
+            fallback = getattr(
+                self.ebay_client,
+                "fetch_active_browse_inventory_quantities",
+                None,
+            )
+            if fallback is None:
+                raise
+            try:
+                ebay_rows = await fallback(limit=200)
+            except Exception as browse_exc:
+                raise RuntimeError(
+                    "eBay quantity reads failed through both Trading and Browse APIs: "
+                    f"{trading_exc}; {browse_exc}"
+                ) from browse_exc
+            if not ebay_rows:
+                raise RuntimeError(
+                    "eBay Trading API quantity read failed and the Browse API returned "
+                    "no active listings; no marketplace quantities were changed."
+                ) from trading_exc
+            ebay_quantity_source = "ebay_browse_api_fallback"
+            ebay_quantity_warning = str(trading_exc)
         ebay_by_sku = {
             str(row["sku"]): {
                 "sku": str(row["sku"]),
@@ -222,10 +248,16 @@ class MarketplaceInventorySyncer:
             if str(row.get("sku") or "").strip()
         }
         walmart_skus_by_item_id: dict[str, set[str]] = {}
-        for walmart_sku, draft in draft_by_sku.items():
+        inferred_item_ids = {
+            walmart_sku: _ebay_item_id_from_walmart_sku(walmart_sku)
+            for walmart_sku in walmart_skus
+        }
+        for walmart_sku in walmart_skus:
+            draft = draft_by_sku.get(walmart_sku) or {}
             item_id = str(
                 draft.get("ebay_item_id")
                 or (draft.get("source_snapshot") or {}).get("ebay_item_id")
+                or inferred_item_ids.get(walmart_sku)
                 or ""
             ).strip()
             if item_id:
@@ -248,12 +280,16 @@ class MarketplaceInventorySyncer:
             item_id = str(
                 draft.get("ebay_item_id")
                 or source_snapshot.get("ebay_item_id")
+                or inferred_item_ids.get(walmart_sku)
                 or ""
             ).strip()
             if source_row is None and item_id:
                 ebay_candidates = ebay_rows_by_item_id.get(item_id) or []
                 walmart_candidates = walmart_skus_by_item_id.get(item_id) or set()
-                if len(ebay_candidates) == 1 and len(walmart_candidates) == 1:
+                if len(ebay_candidates) == 1 and (
+                    len(walmart_candidates) == 1
+                    or inferred_item_ids.get(walmart_sku) is not None
+                ):
                     source_row = ebay_candidates[0]
                 elif ebay_candidates:
                     unresolved_alias_skus.add(walmart_sku)
@@ -285,7 +321,14 @@ class MarketplaceInventorySyncer:
         }
         common_skus = sorted(ebay_by_sku)
         ended_skus = sorted(
-            (walmart_skus & set(draft_by_sku))
+            (
+                (walmart_skus & set(draft_by_sku))
+                | {
+                    sku
+                    for sku, item_id in inferred_item_ids.items()
+                    if item_id
+                }
+            )
             - set(ebay_by_sku)
             - unresolved_alias_skus
         )
@@ -299,6 +342,8 @@ class MarketplaceInventorySyncer:
                     1 for row in ebay_source_by_sku.values() if row["image_urls"]
                 ),
                 "walmart_published_skus": len(walmart_skus),
+                "ebay_quantity_source": ebay_quantity_source,
+                "ebay_quantity_warning": ebay_quantity_warning,
                 "unresolved_alias_skus": len(unresolved_alias_skus),
                 "ended_ebay_skus": 0,
                 "updated_ebay": 0,
@@ -556,7 +601,11 @@ class MarketplaceInventorySyncer:
             fields["ebay_primary_image_url"] = current_primary
             if source_row["image_complete"]:
                 fields["last_ebay_image_scan_at"] = now_iso
-            elif source_row["item_id"] and (main_image_changed or scan_is_stale):
+            elif (
+                ebay_quantity_source == "ebay_trading_api"
+                and source_row["item_id"]
+                and (main_image_changed or scan_is_stale)
+            ):
                 image_refresh_item_ids.add(source_row["item_id"])
 
         refreshed_image_rows: list[dict[str, Any]] = []
@@ -888,6 +937,8 @@ class MarketplaceInventorySyncer:
                 1 for row in ebay_source_by_sku.values() if row["image_urls"]
             ),
             "walmart_published_skus": len(walmart_skus),
+            "ebay_quantity_source": ebay_quantity_source,
+            "ebay_quantity_warning": ebay_quantity_warning,
             "ended_ebay_skus": len(ended_skus),
             "unresolved_alias_skus": len(unresolved_alias_skus),
             "updated_ebay": len(ebay_updates) - len(failed_ebay_skus),
@@ -943,6 +994,11 @@ def _normalized_image_urls(value: object) -> list[str]:
         if len(urls) >= 20:
             break
     return urls
+
+
+def _ebay_item_id_from_walmart_sku(sku: str) -> str | None:
+    match = re.match(r"^EBAY-(\d{9,15})(?:-|$)", str(sku or "").strip(), re.IGNORECASE)
+    return match.group(1) if match else None
 
 
 def _image_signature(urls: list[str]) -> str:

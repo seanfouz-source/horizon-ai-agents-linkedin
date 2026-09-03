@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from app.inventory import InventoryRepository
 from app.marketplace_inventory_sync import (
     MarketplaceInventorySyncer,
+    QUANTITY_POLICY_VERSION,
     choose_ended_listing_sync_plan,
     choose_inventory_sync_plan,
 )
@@ -16,7 +17,7 @@ def _state(quantity: int, **overrides):
         "synced_quantity": quantity,
         "pending_walmart_quantity": None,
         "pending_walmart_at": None,
-        "quantity_policy_version": 2,
+        "quantity_policy_version": QUANTITY_POLICY_VERSION,
     }
     state.update(overrides)
     return state
@@ -39,7 +40,7 @@ def test_policy_upgrade_baselines_from_ebay_without_altering_it():
             "synced_quantity": 5,
             "pending_walmart_quantity": None,
             "pending_walmart_at": None,
-            "quantity_policy_version": 1,
+            "quantity_policy_version": QUANTITY_POLICY_VERSION - 1,
         },
     )
 
@@ -493,7 +494,7 @@ def test_later_walmart_sale_reduces_ebay_through_client_call(tmp_path):
         ebay_quantity=2,
         walmart_quantity=2,
         synced_quantity=2,
-        quantity_policy_version=2,
+        quantity_policy_version=QUANTITY_POLICY_VERSION,
         last_source="already_equal",
         status="synced",
     )
@@ -548,7 +549,7 @@ def test_walmart_alias_sale_updates_original_ebay_sku_by_item_id(tmp_path):
         ebay_quantity=2,
         walmart_quantity=2,
         synced_quantity=2,
-        quantity_policy_version=2,
+        quantity_policy_version=QUANTITY_POLICY_VERSION,
         last_source="already_equal",
         status="synced",
     )
@@ -632,3 +633,115 @@ def test_ambiguous_walmart_aliases_are_not_zeroed_or_applied_to_ebay(tmp_path):
     assert result["ended_ebay_skus"] == 0
     assert ebay.revisions == []
     assert walmart.inventory_payloads == []
+
+
+def test_ebay_number_sku_maps_to_live_seller_sku_without_a_draft(tmp_path):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    repository.upsert_items(
+        [
+            InventoryItem(
+                sku="PHONE-LIVE",
+                ebay_item_id="123456789012",
+                title="Samsung phone",
+                quantity=3,
+                source="ebay-api",
+            )
+        ]
+    )
+    ebay = FakeEbayClient()
+    ebay.rows = [
+        {
+            "sku": "PHONE-LIVE",
+            "item_id": "123456789012",
+            "quantity": 3,
+            "image_urls": [],
+        }
+    ]
+    walmart = FakeWalmartClient()
+    walmart.published_items = [
+        {
+            "sku": "EBAY-123456789012",
+            "published_status": "PUBLISHED",
+            "lifecycle_status": "ACTIVE",
+            "product_type": "Cell Phones",
+            "product_id_type": "GTIN",
+            "product_id": "00123456789012",
+        }
+    ]
+    walmart.quantities = {"EBAY-123456789012": 0}
+
+    result = asyncio.run(MarketplaceInventorySyncer(repository, ebay, walmart).sync_once())
+
+    assert result["updated_ebay"] == 0
+    assert result["updated_walmart"] == 1
+    assert result["unresolved_alias_skus"] == 0
+    assert result["ended_ebay_skus"] == 0
+    assert ebay.revisions == []
+    assert walmart.inventory_payloads[0]["Inventory"][0]["sku"] == "EBAY-123456789012"
+    assert walmart.inventory_payloads[0]["Inventory"][0]["quantity"]["amount"] == 3
+
+
+def test_trading_quota_failure_uses_browse_quantities_and_rebaselines_from_ebay(tmp_path):
+    class BrowseFallbackEbayClient(FakeEbayClient):
+        async def fetch_active_inventory_quantities(self, *, limit):
+            raise ValueError("Trading API usage limit exceeded")
+
+        async def fetch_active_browse_inventory_quantities(self, *, limit):
+            assert limit == 200
+            return [
+                {
+                    "sku": "EBAY-123456789012",
+                    "item_id": "123456789012",
+                    "quantity": 2,
+                    "inventory_tracking": "item_id",
+                    "image_urls": [],
+                    "image_complete": False,
+                }
+            ]
+
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    repository.upsert_items(
+        [
+            InventoryItem(
+                sku="EBAY-123456789012",
+                ebay_item_id="123456789012",
+                title="Samsung phone",
+                quantity=2,
+                source="ebay-browse-api",
+            )
+        ]
+    )
+    repository.upsert_marketplace_inventory_sync_state(
+        sku="EBAY-123456789012",
+        ebay_item_id="123456789012",
+        ebay_quantity=2,
+        walmart_quantity=0,
+        synced_quantity=2,
+        quantity_policy_version=QUANTITY_POLICY_VERSION - 1,
+        last_source="walmart_sale",
+        status="synced",
+    )
+    ebay = BrowseFallbackEbayClient()
+    walmart = FakeWalmartClient()
+    walmart.published_items = [
+        {
+            "sku": "EBAY-123456789012",
+            "published_status": "PUBLISHED",
+            "lifecycle_status": "ACTIVE",
+            "product_type": "Cell Phones",
+            "product_id_type": "GTIN",
+            "product_id": "00123456789012",
+        }
+    ]
+    walmart.quantities = {"EBAY-123456789012": 0}
+
+    result = asyncio.run(MarketplaceInventorySyncer(repository, ebay, walmart).sync_once())
+
+    assert result["status"] == "ok"
+    assert result["ebay_quantity_source"] == "ebay_browse_api_fallback"
+    assert result["updated_ebay"] == 0
+    assert result["updated_walmart"] == 1
+    assert ebay.revisions == []
+    state = repository.marketplace_inventory_sync_state("EBAY-123456789012")
+    assert state["last_source"] == "ebay_policy_baseline"
+    assert state["quantity_policy_version"] == QUANTITY_POLICY_VERSION

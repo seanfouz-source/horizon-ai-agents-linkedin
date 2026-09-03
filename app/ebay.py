@@ -1007,6 +1007,88 @@ class EbayClient:
             response.raise_for_status()
         return self._parse_trading_active_inventory(response.content)
 
+    async def fetch_active_browse_inventory_quantities(
+        self,
+        *,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Fetch active listing quantities without consuming Trading API calls.
+
+        The Browse API does not expose the seller's custom SKU, so each row uses
+        the stable legacy item number. Marketplace reconciliation resolves that
+        item number back to every managed Walmart SKU.
+        """
+        seller_username = str(
+            getattr(self.settings, "ebay_seller_username", "") or ""
+        ).strip()
+        if not seller_username:
+            return []
+
+        rows: list[dict[str, Any]] = []
+        seen_item_ids: set[str] = set()
+        offset = 0
+        requested_limit = max(1, min(int(limit), 200))
+        query = getattr(self.settings, "ebay_browse_search_query", None)
+        if query is None or query == "":
+            query = " "
+
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=30) as client:
+            await self._ensure_access_token(client, prefer_application=True)
+            while len(rows) < requested_limit:
+                response = await self._get(
+                    client,
+                    "/buy/browse/v1/item_summary/search",
+                    params={
+                        "q": query,
+                        "filter": f"sellers:{{{seller_username}}}",
+                        "limit": min(200, requested_limit - len(rows)),
+                        "offset": offset,
+                    },
+                    headers=self._headers(),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                summaries = payload.get("itemSummaries", [])
+                if not summaries:
+                    break
+
+                for summary in summaries:
+                    if not isinstance(summary, dict):
+                        continue
+                    item_id = self._legacy_item_id(summary)
+                    if not item_id or item_id in seen_item_ids:
+                        continue
+                    seen_item_ids.add(item_id)
+                    availability = self._browse_availability(summary)
+                    quantity = max(0, int(availability["quantity"]))
+                    if quantity <= 0:
+                        continue
+                    price = summary.get("price") or {}
+                    row: dict[str, Any] = {
+                        "sku": f"EBAY-{item_id}",
+                        "item_id": item_id,
+                        "quantity": quantity,
+                        "inventory_tracking": "item_id",
+                        "image_urls": self._image_urls_from_browse_item(summary),
+                        "image_complete": False,
+                    }
+                    start_price = self._float_value(price.get("value"))
+                    if start_price is not None:
+                        row["start_price"] = start_price
+                        row["currency"] = str(price.get("currency") or "USD")
+                    rows.append(row)
+                    if len(rows) >= requested_limit:
+                        break
+
+                offset += len(summaries)
+                if (
+                    offset >= int(payload.get("total", offset))
+                    or len(summaries) < min(200, requested_limit)
+                ):
+                    break
+
+        return rows
+
     async def revise_inventory_quantities(
         self,
         updates: list[dict[str, Any]],
