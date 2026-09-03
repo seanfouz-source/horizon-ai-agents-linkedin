@@ -11,6 +11,7 @@ from app.walmart import (
     build_inventory_feed,
     build_item_image_maintenance_feed,
     build_offer_match_preview,
+    build_offer_match_from_catalog_template,
     build_walmart_catalog_query,
     build_walmart_draft,
     estimated_shipping_weight_lbs,
@@ -173,6 +174,68 @@ def test_full_item_builder_uses_walmart_spec_template_and_ebay_offer_data():
         "https://i5.walmartimages.com/catalog.jpg",
     ]
     assert visible["has_written_warranty"] == "No"
+
+
+def test_offer_match_builder_preserves_walmart_template_identifier_and_category():
+    item = InventoryItem(
+        sku="EBAY-MATCH-1",
+        title="Apple iPhone 13 256GB Blue Open Box",
+        condition="Open box",
+        price=385,
+        quantity=4,
+        image_url="https://i.ebayimg.com/images/g/primary/s-l1600.jpg",
+    )
+    catalog = {
+        "status": "matched",
+        "matched": True,
+        "feed_type": "MP_ITEM_MATCH",
+        "version": "4.2",
+        "item_spec_payload": {
+            "MPItemFeedHeader": {
+                "sellingChannel": "mpsetupbymatch",
+                "locale": "en",
+                "version": "4.2",
+                "subset": "external",
+            },
+            "MPItem": [
+                {
+                    "Item": {
+                        "productIdentifiers": {
+                            "productId": "00194252709474",
+                            "productIdType": "GTIN",
+                        },
+                        "productCategory": "Electronics Other",
+                    }
+                }
+            ],
+        },
+    }
+
+    payload = build_offer_match_from_catalog_template(
+        item,
+        catalog,
+        {
+            "product_id_type": "EAN",
+            "product_id": "0194252709474",
+            "shipping_weight_lbs": 2.0,
+            "price": 423.5,
+            "condition": "Open Box",
+            "main_image_url": item.image_url,
+        },
+    )
+
+    assert payload["MPItemFeedHeader"]["subset"] == "external"
+    offer = payload["MPItem"][0]["Item"]
+    assert offer["productIdentifiers"] == {
+        "productId": "00194252709474",
+        "productIdType": "GTIN",
+    }
+    assert offer["productCategory"] == "Electronics Other"
+    assert offer["sku"] == item.sku
+    assert offer["price"] == 423.5
+    assert offer["ShippingWeight"] == 2.0
+    assert offer["condition"] == "Open Box"
+    assert offer["mainImageUrl"] == item.image_url
 
 
 def test_offer_match_preview_blocks_missing_identifier_and_weight():

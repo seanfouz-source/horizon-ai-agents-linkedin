@@ -85,6 +85,7 @@ from app.walmart import (
     build_walmart_draft,
     build_full_item_from_catalog_template,
     build_inventory_feed,
+    build_offer_match_from_catalog_template,
     build_offer_match_preview,
     estimated_shipping_weight_lbs,
     normalize_product_identifier,
@@ -721,6 +722,7 @@ async def _prepare_walmart_import(
     )
     preview["ebay_sync"] = ebay_refresh
     preview["walmart_configured"] = walmart_client.configured
+    preview["match_item_payloads"] = []
     preview["full_item_payloads"] = []
 
     if not (force_verify_catalog or import_request.verify_catalog):
@@ -733,6 +735,7 @@ async def _prepare_walmart_import(
         )
 
     items_by_sku = {item.sku: item for item in items}
+    match_item_payloads: list[dict[str, Any]] = []
     full_item_payloads: list[dict[str, Any]] = []
     for item_result in preview["items"]:
         if not item_result["ready"]:
@@ -747,7 +750,20 @@ async def _prepare_walmart_import(
             raise _walmart_http_error(exc) from exc
         item_result["catalog"] = catalog
         if catalog.get("matched") is True:
-            item_result["submission_route"] = "MP_ITEM_MATCH"
+            try:
+                match_payload = build_offer_match_from_catalog_template(
+                    items_by_sku[str(item_result["sku"])],
+                    catalog,
+                    resolved,
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                item_result["ready"] = False
+                item_result["errors"].append(str(exc))
+            else:
+                item_result["submission_route"] = "MP_ITEM_MATCH"
+                match_item_payloads.append(
+                    {"sku": str(item_result["sku"]), "payload": match_payload}
+                )
         elif (
             catalog.get("status") == "full_item_required"
             and isinstance(catalog.get("item_spec_payload"), dict)
@@ -774,17 +790,14 @@ async def _prepare_walmart_import(
         elif catalog.get("matched") is None:
             item_result["warnings"].append(str(catalog.get("reason") or "Catalog match was not checked."))
 
-    match_ready_skus = {
-        item["sku"]
-        for item in preview["items"]
-        if item["ready"] and item.get("submission_route") == "MP_ITEM_MATCH"
-    }
+    match_ready_skus = {row["sku"] for row in match_item_payloads}
     ready_skus = {item["sku"] for item in preview["items"] if item["ready"]}
     preview["payload"]["MPItem"] = [
         entry
         for entry in preview["payload"]["MPItem"]
         if entry.get("Item", {}).get("sku") in match_ready_skus
     ]
+    preview["match_item_payloads"] = match_item_payloads
     preview["full_item_payloads"] = full_item_payloads
     preview["match_ready_skus"] = sorted(match_ready_skus)
     preview["full_item_ready_skus"] = sorted(
@@ -923,16 +936,6 @@ def _condition_specific_catalog_candidate(candidate: dict[str, Any]) -> bool:
             "restored",
             "used ",
         )
-    )
-
-
-def _walmart_original_identifier_retry(draft: dict[str, Any]) -> bool:
-    if str(draft.get("publish_status") or "") != "blocked_offer_error":
-        return False
-    error = str(draft.get("publish_error") or "").lower()
-    return (
-        "associated original product is in new condition" in error
-        or "pcf is invalid/not_eligible" in error
     )
 
 
@@ -1390,24 +1393,39 @@ def _group_walmart_full_item_payloads(
     return list(groups.values())
 
 
+def _group_walmart_match_item_payloads(
+    payload_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for row in payload_rows:
+        sku = str(row.get("sku") or "").strip()
+        payload = row.get("payload")
+        if not sku or not isinstance(payload, dict):
+            continue
+        header = payload.get("MPItemFeedHeader")
+        entries = payload.get("MPItem")
+        if not isinstance(header, dict) or not isinstance(entries, list) or len(entries) != 1:
+            continue
+        key = json.dumps(header, sort_keys=True, separators=(",", ":"))
+        group = groups.setdefault(
+            key,
+            {
+                "feed_type": "MP_ITEM_MATCH",
+                "skus": [],
+                "payload": {"MPItemFeedHeader": header, "MPItem": []},
+            },
+        )
+        group["skus"].append(sku)
+        group["payload"]["MPItem"].append(entries[0])
+    return list(groups.values())
+
+
 def _walmart_offer_groups_from_preflight(
     preflight: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    groups: list[dict[str, Any]] = []
-    match_ready_skus = set(preflight.get("match_ready_skus") or [])
-    match_entries = [
-        entry
-        for entry in (preflight.get("payload") or {}).get("MPItem", [])
-        if entry.get("Item", {}).get("sku") in match_ready_skus
-    ]
-    if match_entries:
-        groups.append(
-            {
-                "feed_type": "MP_ITEM_MATCH",
-                "skus": sorted(match_ready_skus),
-                "payload": {**preflight["payload"], "MPItem": match_entries},
-            }
-        )
+    groups = _group_walmart_match_item_payloads(
+        preflight.get("match_item_payloads") or []
+    )
     groups.extend(
         _group_walmart_full_item_payloads(preflight.get("full_item_payloads") or [])
     )
@@ -1692,7 +1710,6 @@ async def _run_walmart_auto_publish_once(
                     continue
             if (
                 publish_status in nonrepeatable_states
-                and not _walmart_original_identifier_retry(draft)
                 and not _walmart_full_item_retry(draft)
             ):
                 awaiting_walmart.append(item.sku)

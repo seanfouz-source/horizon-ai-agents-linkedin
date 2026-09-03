@@ -696,6 +696,71 @@ def build_full_item_from_catalog_template(
     return payload
 
 
+def build_offer_match_from_catalog_template(
+    item: InventoryItem,
+    catalog: dict[str, Any],
+    resolved: dict[str, Any],
+) -> dict[str, Any]:
+    """Overlay seller-owned offer data on Walmart's exact setup-by-match template."""
+    raw_template = catalog.get("item_spec_payload")
+    if not isinstance(raw_template, dict):
+        raise ValueError("Walmart did not return an itemSpecPayload template for setup by match.")
+    payload = copy.deepcopy(raw_template)
+    header = payload.get("MPItemFeedHeader")
+    entries = payload.get("MPItem")
+    if not isinstance(header, dict) or not str(header.get("version") or "").strip():
+        raise ValueError("The Walmart match template is missing its required specification version.")
+    if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], dict):
+        raise ValueError("The Walmart match template did not contain exactly one MPItem record.")
+
+    catalog_version = str(catalog.get("version") or "").strip()
+    if catalog_version and str(header.get("version") or "").strip() != catalog_version:
+        raise ValueError("The Walmart match template version does not match its catalog response.")
+
+    entry = entries[0].get("Item")
+    if not isinstance(entry, dict):
+        raise ValueError("The Walmart match template is missing its Item content block.")
+
+    product_id_type, product_id = normalize_product_identifier(
+        resolved.get("product_id_type"), resolved.get("product_id")
+    )
+    if not product_id_type or not product_id:
+        raise ValueError("Setup by match requires a valid Walmart product identifier.")
+    template_identifiers = entry.get("productIdentifiers")
+    if not isinstance(template_identifiers, dict):
+        raise ValueError("The Walmart match template is missing product identifiers.")
+    template_type, template_id = normalize_product_identifier(
+        template_identifiers.get("productIdType"), template_identifiers.get("productId")
+    )
+    if not template_type or not template_id:
+        raise ValueError("The Walmart match template contains invalid product identifiers.")
+    if _canonical_product_id(template_type, template_id) != _canonical_product_id(
+        product_id_type, product_id
+    ):
+        raise ValueError("The Walmart match template identifier does not match the eBay item identifier.")
+
+    price = resolved.get("price")
+    shipping_weight = resolved.get("shipping_weight_lbs")
+    condition = str(resolved.get("condition") or "").strip()
+    if not isinstance(price, (int, float)) or price <= 0:
+        raise ValueError("Setup by match requires a positive Walmart price.")
+    if not isinstance(shipping_weight, (int, float)) or shipping_weight <= 0:
+        raise ValueError("Setup by match requires a positive shipping weight.")
+    if condition not in SUPPORTED_CONDITIONS:
+        raise ValueError("Setup by match requires a supported Walmart condition.")
+
+    entry["sku"] = item.sku
+    entry["price"] = round(float(price), 2)
+    entry["ShippingWeight"] = round(float(shipping_weight), 3)
+    entry["condition"] = condition
+    main_image_url = str(resolved.get("main_image_url") or "").strip()
+    if main_image_url:
+        entry["mainImageUrl"] = main_image_url
+    else:
+        entry.pop("mainImageUrl", None)
+    return payload
+
+
 def _canonical_product_id(product_id_type: str, product_id: str) -> str:
     return product_id if product_id_type == "ISBN" else product_id.zfill(14)
 

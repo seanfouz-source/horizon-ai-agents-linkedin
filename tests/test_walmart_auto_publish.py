@@ -23,6 +23,26 @@ class FakeWalmartClient:
             "status": "matched",
             "matched": True,
             "feed_type": "MP_ITEM_MATCH",
+            "version": "4.2",
+            "item_spec_payload": {
+                "MPItemFeedHeader": {
+                    "sellingChannel": "mpsetupbymatch",
+                    "locale": "en",
+                    "version": "4.2",
+                    "subset": "external",
+                },
+                "MPItem": [
+                    {
+                        "Item": {
+                            "productIdentifiers": {
+                                "productIdType": "GTIN",
+                                "productId": "00887276900124",
+                            },
+                            "productCategory": "Electronics Other",
+                        }
+                    }
+                ],
+            },
         }
 
     async def list_published_items(self, *, limit=1000):
@@ -578,21 +598,6 @@ def test_condition_specific_walmart_upc_is_replaced_with_original_identifier(
     assert override.product_id == "194252020432"
     assert override.product_id != "683346583606"
     assert result["identifier_source"] == "verified_online_identifier"
-
-
-def test_original_product_identifier_walmart_error_is_eligible_for_research_retry():
-    assert main_module._walmart_original_identifier_retry(
-        {
-            "publish_status": "blocked_offer_error",
-            "publish_error": (
-                "A Pre-Owned item can only be created when the associated original product "
-                "is in New condition. The PCF is invalid/Not_eligible for processing"
-            ),
-        }
-    )
-    assert not main_module._walmart_original_identifier_retry(
-        {"publish_status": "blocked_offer_error", "publish_error": "Generic data error"}
-    )
 
 
 def test_walmart_full_setup_error_is_eligible_for_template_retry():
