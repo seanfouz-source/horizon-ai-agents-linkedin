@@ -770,7 +770,7 @@ def test_both_ebay_quotas_use_latest_store_snapshot_without_zeroing_missing_item
                 sku="EBAY-123456789012",
                 ebay_item_id="123456789012",
                 title="Samsung phone",
-                quantity=1,
+                quantity=5,
                 price=200.0,
                 source="ebay-store-page",
             )
@@ -801,10 +801,84 @@ def test_both_ebay_quotas_use_latest_store_snapshot_without_zeroing_missing_item
 
     assert result["status"] == "ok"
     assert result["ebay_quantity_source"] == "ebay_repository_cache_fallback"
+    assert result["quantity_sync_paused"] is True
     assert result["updated_ebay"] == 0
-    assert result["updated_walmart"] == 1
+    assert result["updated_walmart"] == 0
     assert result["zeroed_walmart"] == 0
     assert result["ended_ebay_skus"] == 0
     assert ebay.revisions == []
-    assert walmart.inventory_payloads[0]["Inventory"][0]["sku"] == "EBAY-123456789012"
-    assert walmart.inventory_payloads[0]["Inventory"][0]["quantity"]["amount"] == 1
+    assert walmart.inventory_payloads == []
+    assert repository.get("EBAY-123456789012").quantity == 5
+
+
+def test_exact_source_sku_wins_and_duplicate_walmart_alias_is_zeroed(tmp_path):
+    repository = InventoryRepository(tmp_path / "inventory.db")
+    repository.upsert_items(
+        [
+            InventoryItem(
+                sku="PHONE-LIVE",
+                ebay_item_id="100",
+                title="Live Samsung phone",
+                quantity=5,
+                source="ebay-api",
+            )
+        ]
+    )
+    repository.upsert_walmart_drafts(
+        [
+            {
+                "sku": sku,
+                "ebay_item_id": "100",
+                "source_snapshot": {
+                    "sku": "PHONE-LIVE" if sku == "PHONE-LIVE" else "OLD-SKU",
+                    "ebay_item_id": "100",
+                    "title": "Live Samsung phone",
+                    "quantity": 5,
+                },
+            }
+            for sku in ("PHONE-LIVE", "LEGACY-WALMART-SKU")
+        ]
+    )
+    ebay = FakeEbayClient()
+    ebay.rows = [
+        {
+            "sku": "PHONE-LIVE",
+            "item_id": "100",
+            "quantity": 5,
+            "image_urls": [],
+        }
+    ]
+    walmart = FakeWalmartClient()
+    walmart.published_items = [
+        {
+            "sku": sku,
+            "published_status": "PUBLISHED",
+            "lifecycle_status": "ACTIVE",
+            "product_type": "Cell Phones",
+            "product_id_type": "GTIN",
+            "product_id": product_id,
+        }
+        for sku, product_id in (
+            ("PHONE-LIVE", "00123456789012"),
+            ("LEGACY-WALMART-SKU", "00123456789029"),
+        )
+    ]
+    walmart.quantities = {"PHONE-LIVE": 5, "LEGACY-WALMART-SKU": 5}
+
+    result = asyncio.run(MarketplaceInventorySyncer(repository, ebay, walmart).sync_once())
+
+    assert result["duplicate_alias_skus"] == 1
+    assert result["updated_ebay"] == 0
+    assert result["zeroed_walmart"] == 1
+    assert ebay.revisions == []
+    assert walmart.inventory_payloads[0]["Inventory"] == [
+        {
+            "sku": "LEGACY-WALMART-SKU",
+            "quantity": {"unit": "EACH", "amount": 0},
+            "inventoryAvailableDate": walmart.inventory_payloads[0]["Inventory"][0][
+                "inventoryAvailableDate"
+            ],
+        }
+    ]
+    alias_state = repository.marketplace_inventory_sync_state("LEGACY-WALMART-SKU")
+    assert alias_state["last_source"] == "duplicate_alias:PHONE-LIVE"

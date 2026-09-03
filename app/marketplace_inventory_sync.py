@@ -291,8 +291,14 @@ class MarketplaceInventorySyncer:
             for row in ebay_rows
             if str(row.get("sku") or "").strip()
         }
-        for row in ebay_by_sku.values():
-            self.repository.update_inventory_quantity(row["sku"], row["quantity"])
+        quantity_sync_paused = ebay_quantity_source == "ebay_repository_cache_fallback"
+        # Public store-page snapshots prove that a listing exists, but they do
+        # not expose its exact available quantity. Those rows use a conservative
+        # placeholder of one. Never let that placeholder overwrite an exact
+        # repository quantity or either marketplace.
+        if not quantity_sync_paused:
+            for row in ebay_by_sku.values():
+                self.repository.update_inventory_quantity(row["sku"], row["quantity"])
         ebay_source_by_sku = ebay_by_sku
 
         walmart_items = await self.walmart_client.list_published_items(limit=1000)
@@ -346,15 +352,36 @@ class MarketplaceInventorySyncer:
             if source_row is None and item_id:
                 ebay_candidates = ebay_rows_by_item_id.get(item_id) or []
                 walmart_candidates = walmart_skus_by_item_id.get(item_id) or set()
+                exact_source_sku = (
+                    str(ebay_candidates[0].get("sku") or "").strip()
+                    if len(ebay_candidates) == 1
+                    else ""
+                )
                 if len(ebay_candidates) == 1 and (
                     len(walmart_candidates) == 1
                     or inferred_item_ids.get(walmart_sku) is not None
+                    or exact_source_sku in walmart_candidates
                 ):
                     source_row = ebay_candidates[0]
                 elif ebay_candidates:
                     unresolved_alias_skus.add(walmart_sku)
             if source_row is not None:
                 ebay_by_sku[walmart_sku] = source_row
+
+        walmart_skus_by_source_sku: dict[str, set[str]] = {}
+        for walmart_sku, source_row in ebay_by_sku.items():
+            source_sku = str(source_row.get("sku") or "").strip()
+            if source_sku:
+                walmart_skus_by_source_sku.setdefault(source_sku, set()).add(walmart_sku)
+        duplicate_alias_skus: dict[str, str] = {}
+        for source_sku, mapped_walmart_skus in walmart_skus_by_source_sku.items():
+            # Only suppress aliases when the exact eBay SKU is also present as
+            # the unambiguous canonical Walmart SKU. Variation listings without
+            # such a canonical SKU remain unresolved instead of being guessed.
+            if source_sku not in mapped_walmart_skus:
+                continue
+            for walmart_sku in mapped_walmart_skus - {source_sku}:
+                duplicate_alias_skus[walmart_sku] = source_sku
 
         source_skus = {
             str(row.get("sku") or "").strip()
@@ -408,7 +435,9 @@ class MarketplaceInventorySyncer:
                 "walmart_published_skus": len(walmart_skus),
                 "ebay_quantity_source": ebay_quantity_source,
                 "ebay_quantity_warning": ebay_quantity_warning,
+                "quantity_sync_paused": quantity_sync_paused,
                 "unresolved_alias_skus": len(unresolved_alias_skus),
+                "duplicate_alias_skus": len(duplicate_alias_skus),
                 "ended_ebay_skus": 0,
                 "updated_ebay": 0,
                 "updated_walmart": 0,
@@ -459,13 +488,35 @@ class MarketplaceInventorySyncer:
                     pending_walmart_quantity=zero_plan.pending_walmart_quantity,
                     pending_walmart_at=zero_plan.pending_walmart_at,
                 )
-            elif sku in ebay_by_sku:
-                plans[sku] = choose_inventory_sync_plan(
-                    ebay_by_sku[sku]["quantity"],
+            elif sku in duplicate_alias_skus:
+                zero_plan = choose_ended_listing_sync_plan(
                     walmart_quantity_value,
                     states[sku],
                     now=attempted_at,
                 )
+                plans[sku] = InventorySyncPlan(
+                    target_quantity=zero_plan.target_quantity,
+                    source=f"duplicate_alias:{duplicate_alias_skus[sku]}",
+                    update_ebay=False,
+                    update_walmart=zero_plan.update_walmart,
+                    pending_walmart_quantity=zero_plan.pending_walmart_quantity,
+                    pending_walmart_at=zero_plan.pending_walmart_at,
+                )
+            elif sku in ebay_by_sku:
+                if quantity_sync_paused:
+                    plans[sku] = InventorySyncPlan(
+                        target_quantity=walmart_quantity_value,
+                        source="ebay_quantity_unavailable",
+                        update_ebay=False,
+                        update_walmart=False,
+                    )
+                else:
+                    plans[sku] = choose_inventory_sync_plan(
+                        ebay_by_sku[sku]["quantity"],
+                        walmart_quantity_value,
+                        states[sku],
+                        now=attempted_at,
+                    )
             else:
                 plans[sku] = choose_ended_listing_sync_plan(
                     walmart_quantity_value,
@@ -481,7 +532,7 @@ class MarketplaceInventorySyncer:
         price_candidates: dict[str, tuple[float, float, str]] = {}
         price_errors: dict[str, str] = {}
         for sku in common_skus:
-            if sku in excluded_skus:
+            if sku in excluded_skus or sku in duplicate_alias_skus:
                 continue
             source_price = ebay_by_sku[sku].get("start_price")
             if source_price is None:
@@ -639,7 +690,7 @@ class MarketplaceInventorySyncer:
 
         image_refresh_item_ids: set[str] = set()
         for sku in common_skus:
-            if sku in excluded_skus:
+            if sku in excluded_skus or sku in duplicate_alias_skus:
                 continue
             if sku not in image_states or sku not in plans:
                 continue
@@ -688,7 +739,7 @@ class MarketplaceInventorySyncer:
             if str(row.get("sku") or "").strip()
         }
         for sku in common_skus:
-            if sku in excluded_skus:
+            if sku in excluded_skus or sku in duplicate_alias_skus:
                 continue
             if sku not in image_states or sku not in plans:
                 continue
@@ -734,7 +785,7 @@ class MarketplaceInventorySyncer:
         )
         image_candidates: dict[str, list[str]] = {}
         for sku in common_skus:
-            if sku in excluded_skus:
+            if sku in excluded_skus or sku in duplicate_alias_skus:
                 continue
             if sku not in image_states or sku not in plans:
                 continue
@@ -919,9 +970,13 @@ class MarketplaceInventorySyncer:
             source_row = ebay_by_sku.get(sku)
             ebay_quantity = int(source_row["quantity"]) if source_row else 0
             effective_ebay_quantity = (
-                plan.target_quantity
-                if plan.update_ebay and sku not in failed_ebay_skus
-                else ebay_quantity
+                max(0, int(previous.get("ebay_quantity") or 0))
+                if quantity_sync_paused and previous is not None
+                else (
+                    plan.target_quantity
+                    if plan.update_ebay and sku not in failed_ebay_skus
+                    else ebay_quantity
+                )
             )
             if plan.update_ebay and sku not in failed_ebay_skus:
                 self.repository.update_inventory_quantity(sku, plan.target_quantity)
@@ -1003,12 +1058,21 @@ class MarketplaceInventorySyncer:
             "walmart_published_skus": len(walmart_skus),
             "ebay_quantity_source": ebay_quantity_source,
             "ebay_quantity_warning": ebay_quantity_warning,
+            "quantity_sync_paused": quantity_sync_paused,
             "ended_ebay_skus": len(ended_skus),
             "unresolved_alias_skus": len(unresolved_alias_skus),
+            "duplicate_alias_skus": len(duplicate_alias_skus),
             "updated_ebay": len(ebay_updates) - len(failed_ebay_skus),
             "updated_walmart": len(walmart_update_skus) if walmart_submission else 0,
             "zeroed_walmart": (
-                len(set(walmart_update_skus) & (set(ended_skus) | set(excluded_skus)))
+                len(
+                    set(walmart_update_skus)
+                    & (
+                        set(ended_skus)
+                        | set(excluded_skus)
+                        | set(duplicate_alias_skus)
+                    )
+                )
                 if walmart_submission
                 else 0
             ),
